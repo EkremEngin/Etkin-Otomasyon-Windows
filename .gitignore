@@ -1,0 +1,77 @@
+# ══════════════════════════════════════════════════════════════════════════
+# BEYAZ LİSTE — varsayılan: HER ŞEY HARİÇ. Sadece aşağıda tek tek sayılanlar girer.
+#
+# NEDEN bu yön (kara liste değil): kök klasörde ~300 çalışanın adı + T.C. kimlik
+# numarası (Excel, resume/done .txt, runlog, canlı log, ekran görüntüleri) ve BEŞ
+# PORTALIN ŞİFRELERİ duruyor. Kara listede yeni düşen bir veri dosyası sessizce
+# commit'lenir; beyaz listede commit'lenmez. KVKK — T.C. kişisel veridir, git
+# geçmişinden temizlemek neredeyse imkânsızdır.
+#
+# KLASÖR DÜZENİ:
+#   kök/          → 'Etkin Otomasyon.exe' (operatör buna tıklar) + resume/done +
+#                   Excel + şifreler   → veri HİÇBİRİ depoya girmez
+#   kök/Codes/    → kod, doküman, build → SADECE BURASI depoya girer
+#
+# ⚠ SIRA ÖNEMLİ: git'te SON EŞLEŞEN kural kazanır. Önce yasaklar, EN SONDA izinler.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── 1. Varsayılan: her şey hariç ──
+*
+
+# ── 2. Açık yasaklar (1'le zaten hariç; beyaz liste gevşerse İKİNCİ BARİYER. SİLME) ──
+GIRIS_BILGILERI.md
+*şifre*
+*sifre*
+*.xlsx
+*.xls
+*.csv
+*.log
+*.jsonl
+*.png
+izin_done_*
+izin_onaya_done_*
+dgs_done_*
+dgs_onaya_done_*
+dgs_istisna_*
+dgs_kapanis_*
+dgs_retry_*
+fix_*.txt
+gui_canli_log.txt
+build/
+dist/
+__pycache__/
+*.pyc
+*.app/
+EtkinOtomasyon
+.DS_Store
+.venv/
+
+# ── 3. İzinler (EN SONDA — yasakları bilerek ezer) ──
+# Kod klasörü (depoya giren TEK klasör)
+!Codes/
+
+# Kod
+!*.py
+!*.spec
+!requirements.txt
+!.gitignore
+
+# Kod arşivleri (PII taraması yapıldı: T.C. yok)
+!prime/
+!yedekler/
+!TPI SCRIPT/
+
+# Seçili dokümanlar. Diğer .md'ler (EXE_DEVIR, EXE_BUILD, PRIME_SCRIPTS,
+# GIRIS_BILGILERI, DEVAM_REHBERI…) BİLEREK dışarıda: çalışan adı / giriş bilgisi içeriyorlar.
+!README.md
+!WINDOWS_BUILD_PROMPT.md
+
+# Uygulama görselleri — '*.png' yasağını SADECE Codes/assets/ için deler
+# (spec bunları ister, yoksa Windows build'i patlar). Yol Codes/ altına sabitli.
+!Codes/assets/
+!Codes/assets/*.png
+!Codes/assets/*.ico
+
+# Windows derlenmiş exe — kullanıcı kararı: repoda bulunsun (operatör direkt indirip çalıştırır).
+# SADECE bu tek dosya; başka .exe girmesin diye tam ad + kök çıpası (/) ile.
+!/Etkin Otomasyon.exe
