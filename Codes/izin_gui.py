@@ -77,13 +77,33 @@ AYAR_DOSYASI = os.path.join(DATA_DIR, "gui_ayarlar.json")
 
 # Dosya diyaloğu uzantı filtreleri.
 # ⚠ Desen listesi TUPLE olarak verilir — tek string içinde boşlukla ayırmak ("*.xlsx *.xlsm")
-#   platformlar arasında güvenilir değil. Büyük harfli karşılıkları da yazılı: macOS/Linux'ta Tk
-#   eşleştirmeyi KENDİ yapar ve büyük/küçük harf duyarlıdır; "RAPOR.XLSX" aksi halde listelenmez.
+#   platformlar arasında güvenilir değil.
 # ⚠ Her filtreye "Tüm dosyalar" eklenir: filtre beklenmedik bir şey yaparsa kullanıcı yine de
 #   dosyasını görebilsin — kilitlenip "hiçbir şey görünmüyor" durumuna düşmesin.
-EXCEL_TIPLERI = [("Excel dosyası", ("*.xlsx", "*.xlsm", "*.XLSX", "*.XLSM")),
+
+
+def _uzanti_desenleri(uzantilar) -> tuple:
+    """Uzantı listesini diyalog desenine çevir — platforma göre.
+
+    🔴 Windows'un YEREL diyaloğu filtreyi harf duyarsız uygular: "*.xlsx" zaten RAPOR.XLSX'i de
+    gösterir, büyük harfli KOPYA desen eklemek gereksiz. macOS/Linux'ta ise eşleştirmeyi Tk kendi
+    yapar ve harf DUYARLIDIR → orada büyük harfli karşılıklar şart. Tek listeyi iki platforma da
+    dayatmak, desen sayısını gereksiz şişiriyordu.
+    """
+    kucuk = tuple(f"*{u}" for u in uzantilar)
+    if sys.platform.startswith("win"):
+        return kucuk
+    return kucuk + tuple(f"*{u.upper()}" for u in uzantilar)
+
+
+# Motor openpyxl kullanıyor → SADECE bunları AÇABİLİR (.xls eski ikili biçim, openpyxl açmaz).
+EXCEL_OKUNABILIR = (".xlsx", ".xlsm")
+# Diyalogda GÖRÜNENLER daha geniş: kullanıcı dosyasını göremezse "hiçbir şey yok" sanıyor.
+# Okunamayan bir tip seçilirse _excel_uygun_mu net bir hata verir — gizlemek yerine açıklıyoruz.
+EXCEL_GORUNUR = (".xlsx", ".xlsm", ".xls", ".xlsb", ".csv")
+EXCEL_TIPLERI = [("Excel / tablo dosyası", _uzanti_desenleri(EXCEL_GORUNUR)),
                  ("Tüm dosyalar", "*.*")]
-PDF_TIPLERI = [("PDF belgesi", ("*.pdf", "*.PDF")), ("Tüm dosyalar", "*.*")]
+PDF_TIPLERI = [("PDF belgesi", _uzanti_desenleri((".pdf",))), ("Tüm dosyalar", "*.*")]
 
 # 🔴 SÜRÜM DAMGASI — exe'nin İÇİNE gömülür. Depodaki 'Etkin Otomasyon.exe' bir BUILD ÇIKTISIDIR:
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
@@ -1318,6 +1338,8 @@ class IzinGUI:
             filetypes=EXCEL_TIPLERI,
             initialdir=bas)
         self._secici_teshis("İzin Excel'i", bas, f)
+        if f and not self._excel_uygun_mu(f):
+            return
         if f:
             self.excel_path.set(f)
             self._klasoru_hatirla("izin_excel", f, dosya_mi=True)
@@ -1330,10 +1352,48 @@ class IzinGUI:
         iş çıkarmadan, log penceresinden (Windows'ta zaten açık) okunabiliyor.
         """
         if sonuc is None:
-            self._log(f"[SEÇİCİ] {tip} açılıyor · başlangıç={baslangic or '(yok)'} "
-                      f"· klasör var mı={os.path.isdir(baslangic) if baslangic else False}\n")
+            var = os.path.isdir(baslangic) if baslangic else False
+            self._log(f"[SEÇİCİ] {tip} açılıyor · başlangıç={baslangic or '(yok)'} · klasör var mı={var}"
+                      f"{' · içerik: ' + self._klasor_ozeti(baslangic) if var else ''}\n")
         else:
             self._log(f"[SEÇİCİ] {tip} sonuç={sonuc or '(iptal)'}\n")
+
+    @staticmethod
+    def _klasor_ozeti(klasor: str, tavan: int = 8) -> str:
+        """Klasörde hangi UZANTIDAN kaç tane var — ör. ".pdf×12 .xlsx×2".
+
+        🔴 DOSYA ADI YAZILMAZ: log dosyaya düşüyor ve paylaşılıyor; adlar çalışan bilgisi taşır.
+        Uzantı dağılımı "dosyam burada mı, filtre mi saklıyor?" sorusunu tek satırda yanıtlar —
+        Windows'ta bu soruyu yanıtlamak için kullanıcıya komut satırında iş çıkarmak zorunda
+        kalmıştık.
+        """
+        try:
+            sayac = {}
+            for ad in os.listdir(klasor):
+                if os.path.isfile(os.path.join(klasor, ad)):
+                    u = (os.path.splitext(ad)[1] or "(uzantısız)").lower()
+                    sayac[u] = sayac.get(u, 0) + 1
+            if not sayac:
+                return "hiç dosya yok"
+            sirali = sorted(sayac.items(), key=lambda kv: (-kv[1], kv[0]))
+            metin = " ".join(f"{u}×{n}" for u, n in sirali[:tavan])
+            return metin + (" …" if len(sirali) > tavan else "")
+        except OSError as e:
+            return f"okunamadı ({e.__class__.__name__})"
+
+    def _excel_uygun_mu(self, yol: str) -> bool:
+        """Seçilen dosyayı motor AÇABİLİR mi? Açamıyorsa sessizce kabul etme, NE YAPILACAĞINI söyle."""
+        u = os.path.splitext(yol)[1].lower()
+        if u in EXCEL_OKUNABILIR:
+            return True
+        self._log(f"[SEÇİCİ] ⚠ desteklenmeyen Excel biçimi: {u or '(uzantısız)'}\n")
+        messagebox.showerror(
+            "Bu dosya açılamıyor",
+            f"Seçilen dosyanın biçimi “{u or 'uzantısız'}”.\n\n"
+            "Uygulama yalnız .xlsx ve .xlsm dosyalarını okuyabiliyor.\n\n"
+            "Çözüm: dosyayı Excel'de aç → Dosya → Farklı Kaydet → tür olarak "
+            "“Excel Çalışma Kitabı (*.xlsx)” seç → kaydet, sonra o dosyayı seç.")
+        return False
 
     def _pick_belge(self):
         # 🔴 topmost log penceresi Windows'ta YEREL dosya diyaloğunu tamamen örtebiliyor; diyalog ana
@@ -1985,6 +2045,8 @@ class IzinGUI:
             filetypes=EXCEL_TIPLERI,
             initialdir=bas)
         self._secici_teshis("DGS Excel'i", bas, f)
+        if f and not self._excel_uygun_mu(f):
+            return
         if f:
             self.dgs_excel.set(f)
             self._klasoru_hatirla("dgs_excel", f, dosya_mi=True)
