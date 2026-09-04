@@ -1192,13 +1192,13 @@ class IzinGUI:
             self.belge_entry.configure(state="normal")
             self.belge_lbl.configure(text="Firma tek toplu PDF yolladıysa yalnız o dosyayı seç.", text_color=UI["muted"])
         else:  # per_person
-            self.belge_btn.configure(state="normal", text="Klasör Seç…", command=self._pick_belge)
+            self.belge_btn.configure(state="normal", text="PDF'LERİ SEÇ…", command=self._pick_belge)
             self.belge_info_btn.configure(state="normal")
             self.belge_entry.configure(state="normal")
-            # ⚠ Uyarı BURADA da yazıyor: diyalog başlığını Windows kırpabiliyor, o zaman tek kalan bu.
+            # Artık dosya seçicisi açılıyor (klasör seçici hiç dosya göstermiyordu, bkz. _pick_belge).
             self.belge_lbl.configure(
-                text="Her kişinin PDF'inin bulunduğu KLASÖRÜ seç. Klasör seçici dosyaları "
-                     "listelemez — PDF görmemen normal, klasörün üstüne gelip seç yeter.",
+                text="PDF'lerin olduğu klasöre gir ve HERHANGİ BİR PDF'i seç — o klasörün tamamı "
+                     "kullanılır, hangisini seçtiğin önemli değil.",
                 text_color=UI["muted"])
         # Belge seçimi YALNIZ park gerçekten değiştiğinde sıfırlanır. _switch_module de burayı
         # çağırıyor; koşulsuz temizlik, İZİN↔DGS sekmesine gidip gelen operatörün seçtiği klasörü
@@ -1310,16 +1310,30 @@ class IzinGUI:
 
     def _pick_excel(self):
         self._modal_oncesi()      # topmost log penceresi dosya diyaloğunun ÖNÜNE geçmesin
+        bas = self._baslangic_klasoru("izin_excel", izin_frozen.indirilenler(), izin_frozen.masaustu())
+        self._secici_teshis("İzin Excel'i", bas)
         f = filedialog.askopenfilename(
             parent=self.root,
             title="İzin Excel'i seç",
             filetypes=EXCEL_TIPLERI,
-            initialdir=self._baslangic_klasoru("izin_excel", izin_frozen.indirilenler(),
-                                               izin_frozen.masaustu()))
+            initialdir=bas)
+        self._secici_teshis("İzin Excel'i", bas, f)
         if f:
             self.excel_path.set(f)
             self._klasoru_hatirla("izin_excel", f, dosya_mi=True)
             self._set_status("İzin Excel'i seçildi", "info")
+
+    def _secici_teshis(self, tip: str, baslangic: str, sonuc: str = None):
+        """Dosya seçme sorunlarında kör kalmayalım: hangi diyalog, nereden açıldı, ne seçildi.
+
+        "Hiçbir şey göremiyorum" şikâyetlerinde tek somut veri buydu — kullanıcıya komut satırında
+        iş çıkarmadan, log penceresinden (Windows'ta zaten açık) okunabiliyor.
+        """
+        if sonuc is None:
+            self._log(f"[SEÇİCİ] {tip} açılıyor · başlangıç={baslangic or '(yok)'} "
+                      f"· klasör var mı={os.path.isdir(baslangic) if baslangic else False}\n")
+        else:
+            self._log(f"[SEÇİCİ] {tip} sonuç={sonuc or '(iptal)'}\n")
 
     def _pick_belge(self):
         # 🔴 topmost log penceresi Windows'ta YEREL dosya diyaloğunu tamamen örtebiliyor; diyalog ana
@@ -1329,20 +1343,34 @@ class IzinGUI:
         masa = izin_frozen.masaustu()
         if p.onay_pdf == "ortak":
             # ORTAK mod: park için TEK toplu PDF → dosya seçici.
+            bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
+                                          izin_frozen.indirilenler())
+            self._secici_teshis("ortak belge (tek PDF)", bas)
             f = filedialog.askopenfilename(
                 parent=self.root,
                 title=f"{p.code} — ortak izin belgesi (tek PDF dosyası seç)",
                 filetypes=PDF_TIPLERI,
-                initialdir=self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
-                                                   izin_frozen.indirilenler()))
+                initialdir=bas)
+            self._secici_teshis("ortak belge (tek PDF)", bas, f)
         else:
-            # PER_PERSON mod: kişi başına ayrı PDF → KLASÖR seçici.
-            # ⚠ Klasör seçici tasarımı gereği DOSYA LİSTELEMEZ; kullanıcı bunu "klasörler boş"
-            #   sanabiliyor. Başlıkta açıkça yazıyoruz ki PDF aramaya çalışmasın.
-            f = filedialog.askdirectory(
+            # PER_PERSON mod: motorun istediği şey KLASÖR, ama kullanıcıya DOSYA seçtiriyoruz.
+            #
+            # 🔴 NEDEN (iki kez "hiçbir şey göremiyorum, klasörlerin içi boş" şikâyeti geldi):
+            # Windows'un klasör seçicisi (tk_chooseDirectory → SHBrowseForFolder) tasarımı gereği
+            # HİÇBİR DOSYA GÖSTERMEZ — yalnız klasör ağacı. Operatör PDF'lerini göremeyince doğru
+            # yerde olduğunu doğrulayamıyor ve klasör "boş" sanıyor. Başlığa/etikete uyarı yazmak
+            # yetmedi. Çözüm: normal DOSYA seçicisi aç (PDF'ler GÖRÜNÜR), kullanıcı içlerinden
+            # herhangi birini seçsin, biz o dosyanın KLASÖRÜNÜ alalım. Motora giden değer değişmez.
+            bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa)
+            self._secici_teshis("belge klasörü (PDF üzerinden)", bas)
+            secilen = filedialog.askopenfilename(
                 parent=self.root,
-                title=f"{p.code} — PDF'lerin BULUNDUĞU KLASÖRÜ seç (dosyalar listelenmez)",
-                initialdir=self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa))
+                title=f"{p.code} — izin PDF'lerinin olduğu klasöre gir ve HERHANGİ BİR PDF'i seç",
+                filetypes=PDF_TIPLERI,
+                initialdir=bas)
+            self._secici_teshis("belge klasörü (PDF üzerinden)", bas, secilen)
+            # Seçilen dosyanın klasörü = belge klasörü. Kullanıcı hangi PDF'i seçtiğinin önemi yok.
+            f = os.path.dirname(secilen) if secilen else ""
         if f:
             self.belge_path.set(f)
             self._klasoru_hatirla("belge", f, dosya_mi=(p.onay_pdf == "ortak"))
@@ -1949,12 +1977,14 @@ class IzinGUI:
     # ---------- DGS: seçici + öğretici popup'lar ----------
     def _pick_dgs_excel(self):
         self._modal_oncesi()      # topmost log penceresi dosya diyaloğunun ÖNÜNE geçmesin
+        bas = self._baslangic_klasoru("dgs_excel", izin_frozen.indirilenler(), izin_frozen.masaustu())
+        self._secici_teshis("DGS Excel'i", bas)
         f = filedialog.askopenfilename(
             parent=self.root,
             title="DGS Excel'i seç (teknokent puantaj dosyası)",
             filetypes=EXCEL_TIPLERI,
-            initialdir=self._baslangic_klasoru("dgs_excel", izin_frozen.indirilenler(),
-                                               izin_frozen.masaustu()))
+            initialdir=bas)
+        self._secici_teshis("DGS Excel'i", bas, f)
         if f:
             self.dgs_excel.set(f)
             self._klasoru_hatirla("dgs_excel", f, dosya_mi=True)
