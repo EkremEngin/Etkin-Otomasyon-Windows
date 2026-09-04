@@ -25,6 +25,7 @@ import queue
 import shutil
 import datetime
 import threading
+import traceback
 import subprocess
 import urllib.parse
 import urllib.request
@@ -76,10 +77,13 @@ LOG_YAZI_ALT, LOG_YAZI_UST = 8, 26
 AYAR_DOSYASI = os.path.join(DATA_DIR, "gui_ayarlar.json")
 
 # Dosya diyaloğu uzantı filtreleri.
-# ⚠ Desen listesi TUPLE olarak verilir — tek string içinde boşlukla ayırmak ("*.xlsx *.xlsm")
-#   platformlar arasında güvenilir değil.
-# ⚠ Her filtreye "Tüm dosyalar" eklenir: filtre beklenmedik bir şey yaparsa kullanıcı yine de
-#   dosyasını görebilsin — kilitlenip "hiçbir şey görünmüyor" durumuna düşmesin.
+# ⚠ Desen listesi TUPLE olarak verilir. (Eskiden buradaki yorum "tek string güvenilir değil" diyordu;
+#   ÖLÇÜLDÜ ve YANLIŞ çıktı — Tk her iki biçimi de aynı Tcl listesine çözüyor. Tuple yine de tercih:
+#   uzantı kümesi kodun başka yerinde de kullanılıyor, tek kaynaktan üretmek okunur.)
+# ⚠ Her filtreye "Tüm dosyalar" eklenir ve başlangıç klasöründe dar filtreye uyan hiç dosya yoksa
+#   _tipleri_duzenle onu BAŞA alır: kullanıcı asla "hiçbir şey görünmüyor" durumuna kilitlenmesin.
+# ⚠ Filtre ADINDA uzantılar da yazılı: Windows 11'in yerel diyaloğu açılır listede yalnız ismi
+#   gösteriyor, desenleri göstermiyor → neyin süzüldüğü aksi halde hiç belli olmuyor.
 
 
 def _uzanti_desenleri(uzantilar) -> tuple:
@@ -101,9 +105,9 @@ EXCEL_OKUNABILIR = (".xlsx", ".xlsm")
 # Diyalogda GÖRÜNENLER daha geniş: kullanıcı dosyasını göremezse "hiçbir şey yok" sanıyor.
 # Okunamayan bir tip seçilirse _excel_uygun_mu net bir hata verir — gizlemek yerine açıklıyoruz.
 EXCEL_GORUNUR = (".xlsx", ".xlsm", ".xls", ".xlsb", ".csv")
-EXCEL_TIPLERI = [("Excel / tablo dosyası", _uzanti_desenleri(EXCEL_GORUNUR)),
-                 ("Tüm dosyalar", "*.*")]
-PDF_TIPLERI = [("PDF belgesi", _uzanti_desenleri((".pdf",))), ("Tüm dosyalar", "*.*")]
+EXCEL_TIPLERI = [(f"Excel / tablo ({', '.join(EXCEL_GORUNUR)})", _uzanti_desenleri(EXCEL_GORUNUR)),
+                 ("Tüm dosyalar (*.*)", "*.*")]
+PDF_TIPLERI = [("PDF belgesi (.pdf)", _uzanti_desenleri((".pdf",))), ("Tüm dosyalar (*.*)", "*.*")]
 
 # 🔴 SÜRÜM DAMGASI — exe'nin İÇİNE gömülür. Depodaki 'Etkin Otomasyon.exe' bir BUILD ÇIKTISIDIR:
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
@@ -436,7 +440,11 @@ class IzinGUI:
 
         # Dosya diyaloglarının en son açıldığı klasör (anahtar → yol). Operatör her seferinde
         # aynı yere gitmek zorunda kalmasın; ayrıca varsayılan klasör yoksa buradan kurtarırız.
-        self._son_klasor: "dict[str, str]" = {}
+        # 🔴 KALICI: aksi halde operatör her açılışta aynı yanlış klasöre düşüyor.
+        kayitli = self._ayarlar.get("son_klasor", {})
+        self._son_klasor: "dict[str, str]" = (
+            {k: v for k, v in kayitli.items() if isinstance(v, str) and os.path.isdir(v)}
+            if isinstance(kayitli, dict) else {})
 
         # Log GEÇMİŞİ bellekte tutulur: akış artık ana pencerede DEĞİL, ayrı pencerede gösteriliyor
         # (neden: _build_log). Pencere kapalıyken de birikir, açılınca oraya dökülür. Tavanlı liste.
@@ -458,6 +466,11 @@ class IzinGUI:
             self._log_dosyasi.flush()
         except OSError:
             pass                                   # log dosyası açılamazsa GUI yine de çalışır
+
+        # 🔴 console=False derlenmiş exe'de stderr YOKTUR: yakalanmayan bir Tk geri-çağrı hatası
+        # hiçbir yere yazılmaz, kullanıcıya tuş ÖLÜ görünür ve biz de hiç haberdar olmayız.
+        # Kancayı buraya takıyoruz → hata log'a + gui_canli_log.txt'ye düşer, kullanıcı da görür.
+        root.report_callback_exception = self._tk_hata
 
         self._configure_styles()
         self._build()
@@ -1275,6 +1288,20 @@ class IzinGUI:
             self._set_status("Portal bağlantısı kurulamadı", "danger")
         self._log(f"[LOGIN] {res.get('reason','')}\n")
 
+    def _tk_hata(self, tur, deger, iz):
+        """Yakalanmayan Tk geri-çağrı hatası: sessizce yutma, log'a yaz ve kullanıcıya söyle."""
+        metin = "".join(traceback.format_exception(tur, deger, iz))
+        try:
+            self._log("\n!! BEKLENMEYEN HATA (arayüz):\n" + metin + "\n", tag="danger")
+        except Exception:  # noqa — log da çalışmıyorsa en azından kutuyu göster
+            pass
+        try:
+            messagebox.showerror("Beklenmeyen hata",
+                                 f"{tur.__name__}: {deger}\n\nAyrıntı canlı log penceresinde. "
+                                 f"Kayıt: gui_canli_log.txt")
+        except Exception:  # noqa
+            pass
+
     # ---------- kalıcı ayarlar ----------
     @staticmethod
     def _ayar_oku() -> dict:
@@ -1309,33 +1336,65 @@ class IzinGUI:
         self._ayar_yaz(log_yazi_boy=yeni)
 
     # ---------- seçiciler ----------
-    def _baslangic_klasoru(self, anahtar: str, *adaylar) -> str:
-        """Dosya diyaloğu NEREDEN açılsın: en son kullanılan klasör → adaylar → ev klasörü.
+    @staticmethod
+    def _klasorde_kac(klasor: str, uzantilar) -> int:
+        """Klasörde verilen uzantılardan kaç dosya var? Okunamıyorsa 0. Alt klasöre İNMEZ."""
+        if not klasor or not uzantilar:
+            return 0
+        try:
+            u = tuple(x.lower() for x in uzantilar)
+            return sum(1 for ad in os.listdir(klasor) if ad.lower().endswith(u))
+        except OSError:
+            return 0
 
-        🔴 NEDEN VAR (Windows'ta "hiçbir dosya görünmüyor, klasörler boş" şikâyeti):
-        `initialdir` diskte OLMAYAN bir klasörü gösterirse Windows'un yerel diyaloğu boş açılıyor.
-        Eski kod yolları mac'e göre sabitlemişti (`~/Desktop`, `~/Desktop/İzin Belgeleri`); Windows'ta
-        Masaüstü çoğu zaman OneDrive altına taşındığı için `~/Desktop` HİÇ YOKTU.
-        Burada her aday `isdir` ile sınanır; hiçbiri yoksa ev klasörüne düşeriz — diyalog her koşulda
-        gerçek bir yerde açılır.
+    def _baslangic_klasoru(self, anahtar: str, *adaylar, uzantilar=None) -> str:
+        """Dosya diyaloğu NEREDEN açılsın: son kullanılan → ARANAN DOSYAYI İÇEREN aday → var olan aday.
+
+        🔴 ASIL HATA BURADAYDI ("Excel'leri görmüyor ama PDF'leri görüyor"):
+        Eski sürüm "diskte var olan İLK aday"ı seçiyordu. Windows'ta %USERPROFILE% altındaki Downloads HER
+        ZAMAN vardır → Excel diyaloğu DAİMA İndirilenler'de açılıyor, ikinci aday (Masaüstü) hiç
+        denenmiyordu; İndirilenler'de .xlsx olmadığı için liste boş görünüyordu. PDF diyaloğunun ilk
+        adayı ise Masaüstü/İzin Belgeleri, yani dosyaların gerçekten durduğu yer — o yüzden çalışıyordu.
+        Tek yapısal fark buydu; filtrenin biçimi ölçüldü ve SUÇSUZ çıktı.
+
+        Artık "var mı" yetmiyor: uzantılar verildiyse önce ARANAN DOSYAYI İÇEREN aday seçilir.
+        Hiçbirinde yoksa eski davranışa (var olan ilk klasör) düşülür.
         """
-        son = self._son_klasor.get(anahtar)
-        return izin_frozen._ilk_var_olan(son, *adaylar) or os.path.expanduser("~")
+        adaylar = (self._son_klasor.get(anahtar),) + adaylar
+        if uzantilar:
+            dolu = next((a for a in adaylar if self._klasorde_kac(a, uzantilar)), None)
+            if dolu:
+                return dolu
+        return izin_frozen._ilk_var_olan(*adaylar) or os.path.expanduser("~")
+
+    def _tipleri_duzenle(self, tipler: list, klasor: str, uzantilar) -> list:
+        """Başlangıç klasöründe dar filtreye uyan HİÇ dosya yoksa "Tüm dosyalar"ı BAŞA al.
+
+        🔴 Windows'ta filetypes'ın İLK girdisi varsayılan filtredir ve eşleşmeyen her şeyi GİZLER.
+        Yanlış klasörde açılmış bir diyalog bu yüzden bomboş görünüyor ve operatör açılır listeden
+        "Tüm dosyalar"a geçmeyi bilmiyor (Windows 11 diyaloğu desenleri göstermiyor bile). Normal
+        günde sıra bozulmaz; yalnız "gösterecek bir şey yok" durumunda geniş filtre öne alınır.
+        """
+        if klasor and uzantilar and not self._klasorde_kac(klasor, uzantilar):
+            return [tipler[-1]] + list(tipler[:-1])
+        return tipler
 
     def _klasoru_hatirla(self, anahtar: str, secim: str, dosya_mi: bool):
         """Seçim sonrası: bir dahaki sefere aynı yerden başla (dosya seçildiyse onun klasörü)."""
         yol = os.path.dirname(secim) if dosya_mi else secim
         if yol and os.path.isdir(yol):
             self._son_klasor[anahtar] = yol
+            self._ayar_yaz(son_klasor=dict(self._son_klasor))   # kalıcı — bkz. __init__
 
     def _pick_excel(self):
         self._modal_oncesi()      # topmost log penceresi dosya diyaloğunun ÖNÜNE geçmesin
-        bas = self._baslangic_klasoru("izin_excel", izin_frozen.indirilenler(), izin_frozen.masaustu())
+        bas = self._baslangic_klasoru("izin_excel", izin_frozen.masaustu(), izin_frozen.belgeler(),
+                                      izin_frozen.indirilenler(), uzantilar=EXCEL_GORUNUR)
         self._secici_teshis("İzin Excel'i", bas)
         f = filedialog.askopenfilename(
             parent=self.root,
             title="İzin Excel'i seç",
-            filetypes=EXCEL_TIPLERI,
+            filetypes=self._tipleri_duzenle(EXCEL_TIPLERI, bas, EXCEL_GORUNUR),
             initialdir=bas)
         self._secici_teshis("İzin Excel'i", bas, f)
         if f and not self._excel_uygun_mu(f):
@@ -1404,7 +1463,7 @@ class IzinGUI:
         if p.onay_pdf == "ortak":
             # ORTAK mod: park için TEK toplu PDF → dosya seçici.
             bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
-                                          izin_frozen.indirilenler())
+                                          izin_frozen.indirilenler(), uzantilar=(".pdf",))
             self._secici_teshis("ortak belge (tek PDF)", bas)
             f = filedialog.askopenfilename(
                 parent=self.root,
@@ -1421,7 +1480,8 @@ class IzinGUI:
             # yerde olduğunu doğrulayamıyor ve klasör "boş" sanıyor. Başlığa/etikete uyarı yazmak
             # yetmedi. Çözüm: normal DOSYA seçicisi aç (PDF'ler GÖRÜNÜR), kullanıcı içlerinden
             # herhangi birini seçsin, biz o dosyanın KLASÖRÜNÜ alalım. Motora giden değer değişmez.
-            bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa)
+            bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
+                                          uzantilar=(".pdf",))
             self._secici_teshis("belge klasörü (PDF üzerinden)", bas)
             secilen = filedialog.askopenfilename(
                 parent=self.root,
@@ -2037,12 +2097,13 @@ class IzinGUI:
     # ---------- DGS: seçici + öğretici popup'lar ----------
     def _pick_dgs_excel(self):
         self._modal_oncesi()      # topmost log penceresi dosya diyaloğunun ÖNÜNE geçmesin
-        bas = self._baslangic_klasoru("dgs_excel", izin_frozen.indirilenler(), izin_frozen.masaustu())
+        bas = self._baslangic_klasoru("dgs_excel", izin_frozen.masaustu(), izin_frozen.belgeler(),
+                                      izin_frozen.indirilenler(), uzantilar=EXCEL_GORUNUR)
         self._secici_teshis("DGS Excel'i", bas)
         f = filedialog.askopenfilename(
             parent=self.root,
             title="DGS Excel'i seç (teknokent puantaj dosyası)",
-            filetypes=EXCEL_TIPLERI,
+            filetypes=self._tipleri_duzenle(EXCEL_TIPLERI, bas, EXCEL_GORUNUR),
             initialdir=bas)
         self._secici_teshis("DGS Excel'i", bas, f)
         if f and not self._excel_uygun_mu(f):

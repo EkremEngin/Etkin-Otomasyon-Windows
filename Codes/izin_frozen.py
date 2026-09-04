@@ -51,6 +51,7 @@ def worker_cmd(mode: str) -> list:
 
 _WIN_MASAUSTU = "Desktop"
 _WIN_INDIRILENLER = "{374DE290-123F-4565-9164-39C4925E467B}"   # İndirilenler'in bilinen-klasör GUID'i
+_WIN_BELGELER = "Personal"                                     # Belgeler kayıt defterinde böyle geçer
 
 
 def _win_kabuk_klasoru(anahtar: str) -> "str | None":
@@ -94,6 +95,19 @@ def masaustu() -> str:
         os.path.join(od, "Desktop") if od else None,
         os.path.expanduser("~/Masaüstü"),
         os.path.expanduser("~/Desktop"),
+    ) or os.path.expanduser("~")
+
+
+def belgeler() -> str:
+    """Kullanıcının Belgeler klasörü. E-postayla gelen Excel'in Türkçe Windows'ta en olası yeri."""
+    od = (os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+          or os.environ.get("OneDriveCommercial"))
+    return _ilk_var_olan(
+        _win_kabuk_klasoru(_WIN_BELGELER),
+        os.path.join(od, "Belgeler") if od else None,
+        os.path.join(od, "Documents") if od else None,
+        os.path.expanduser("~/Belgeler"),
+        os.path.expanduser("~/Documents"),
     ) or os.path.expanduser("~")
 
 
