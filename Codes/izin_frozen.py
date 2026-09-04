@@ -88,9 +88,12 @@ def masaustu() -> str:
           or os.environ.get("OneDriveCommercial"))
     return _ilk_var_olan(
         _win_kabuk_klasoru(_WIN_MASAUSTU),
+        # ⚠ Türkçe Windows'ta OneDrive altındaki klasörün FİZİKSEL adı "Masaüstü"dür ("Desktop" değil);
+        #   yalnız İngilizcesini arayınca bu yedek hiç tutmuyordu.
+        os.path.join(od, "Masaüstü") if od else None,
         os.path.join(od, "Desktop") if od else None,
-        os.path.expanduser("~/Desktop"),
         os.path.expanduser("~/Masaüstü"),
+        os.path.expanduser("~/Desktop"),
     ) or os.path.expanduser("~")
 
 

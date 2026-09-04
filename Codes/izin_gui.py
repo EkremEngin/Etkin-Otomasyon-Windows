@@ -65,6 +65,16 @@ FONT_UI = "SF Pro Text" if sys.platform == "darwin" else "Segoe UI"
 FONT_DISPLAY = "SF Pro Display" if sys.platform == "darwin" else "Segoe UI"
 FONT_MONO = "SF Mono" if sys.platform == "darwin" else "Consolas"
 
+# Canlı log yazı boyu.
+# 🔴 WINDOWS'TA NEDEN DAHA BÜYÜK: uygulama DPI-farkında (main() içinde SetProcessDpiAwareness) →
+# Windows onu KENDİ ölçeğiyle büyütmez, ölçeklemeyi biz yaparız. Ölçeğimiz ise tasarımı (1420x920)
+# ekrana sığdırmaktan geliyor; %150 ölçekli 1080p bir dizüstünde bu ~1.0 çıkıyor, yani sistemin
+# büyüttüğü diğer uygulamaların yanında yazı KÜÇÜK kalıyor. Mono 10 punto orada okunmuyordu.
+# Kullanıcı log penceresindeki A− / A+ ile değiştirebilir; seçim gui_ayarlar.json'a yazılır.
+LOG_YAZI_VARSAYILAN = 12 if sys.platform.startswith("win") else 10
+LOG_YAZI_ALT, LOG_YAZI_UST = 8, 26
+AYAR_DOSYASI = os.path.join(DATA_DIR, "gui_ayarlar.json")
+
 # Dosya diyaloğu uzantı filtreleri.
 # ⚠ Desen listesi TUPLE olarak verilir — tek string içinde boşlukla ayırmak ("*.xlsx *.xlsm")
 #   platformlar arasında güvenilir değil. Büyük harfli karşılıkları da yazılı: macOS/Linux'ta Tk
@@ -283,7 +293,12 @@ def launch_chrome(portal_url: str) -> tuple[bool, str]:
 # Arayüz bu MANTIKSAL boyuta göre çizildi (kart genişlikleri, wraplength'ler, sağdaki kartlar).
 # NOT: canlı log artık ana pencerede DEĞİL, ayrı pencerede (bkz. IzinGUI._build_log) — ana pencerenin
 # yükseklik ihtiyacı eskisinden düşük. Alt pencereler ayrıca `_ust_pencere_plani` ile ekrana sığdırılır.
-TASARIM_W, TASARIM_H = 1420, 920
+# TASARIM_H 920'den 820'ye ÇEKİLDİ (2026-09-04): canlı log ana pencereden çıkıp ayrı pencereye
+# taşınınca burada o kadar yüksekliğe ihtiyaç kalmadı. Ölçek "tasarımı çalışma alanına sığdır"
+# hesabından geliyor ve yaygın Windows ekranlarında darboğaz HEP yükseklikti — tasarım kısalınca
+# ölçek yükseliyor, yani YAZILAR VE WIDGET'LAR BÜYÜYOR: 1080p@%150'de 1.02 → 1.14, 1366x768'de
+# 0.73 → 0.82. ("Windows'ta yazılar aşırı küçük" şikâyeti.) 820, ölçülen asgari boyun (760) üstünde.
+TASARIM_W, TASARIM_H = 1420, 820
 
 
 def pencere_plani(sw: int, sh: int, dpi: float, win: bool) -> dict:
@@ -321,7 +336,7 @@ def pencere_plani(sw: int, sh: int, dpi: float, win: bool) -> dict:
         # Minsize de MANTIKSAL birimde (CTk ölçekle çarpacak). 760 tabanı ölçüldü: bunun altında
         # sağ sütun kısalıyor ve canlı log kartı kırpılmaya başlıyor.
         "min_w": int(min(1120, alan_w / olcek)),
-        "min_h": int(min(760, alan_h / olcek)),
+        "min_h": int(min(680, alan_h / olcek)),   # tasarım kısaldı → taban da indi (bkz. TASARIM_H)
         # Ekran 0.7 tabanında bile dar: Windows'ta tam ekran aç → görev çubuğunu WM'in kendisi
         # hesaplar, alt paneller kesin kesilmez.
         "dar": win and (alan_w < TASARIM_W * 0.7 or alan_h < TASARIM_H * 0.7),
@@ -391,6 +406,13 @@ class IzinGUI:
         self._izin_retry_kuyruk: "list[str]" = []
         self._izin_retry_aktif = None             # şu an denenen ad (koşu bitince sonucu buna yazılır)
         self._izin_retry_sonuc: "list[dict]" = []  # [{"ad","ok","mesaj"}] → zincir sonunda özet
+
+        # Kalıcı kullanıcı tercihleri (şimdilik yalnız log yazı boyu). Bozuk/eksik dosya sorun değil:
+        # okunamazsa varsayılana düşeriz, uygulama yine açılır.
+        self._ayarlar = self._ayar_oku()
+        self._log_yazi_boy = self._ayarlar.get("log_yazi_boy", LOG_YAZI_VARSAYILAN)
+        if not isinstance(self._log_yazi_boy, int) or not (LOG_YAZI_ALT <= self._log_yazi_boy <= LOG_YAZI_UST):
+            self._log_yazi_boy = LOG_YAZI_VARSAYILAN
 
         # Dosya diyaloglarının en son açıldığı klasör (anahtar → yol). Operatör her seferinde
         # aynı yere gitmek zorunda kalmasın; ayrıca varsayılan klasör yoksa buradan kurtarırız.
@@ -809,10 +831,12 @@ class IzinGUI:
         # ⚠️ SABİT BOYUTLU KUTU İÇİNDE: çıplak etiket, uzun satırda kendi istediği genişliği büyütüp
         # sağ sütunu (dolayısıyla tüm ızgarayı) her log satırında oynatıyordu. propagate kapalı kutu
         # etiketin ölçüsünü dışarı sızdırmaz — sütun genişliği log metnine göre zıplamaz.
-        ozet_kutu = ctk.CTkFrame(body, fg_color="transparent", height=18)
+        ozet_kutu = ctk.CTkFrame(body, fg_color="transparent",
+                                 height=max(18, self._log_yazi_boy + 8))   # yazı büyüyünce kutu da
         ozet_kutu.pack(fill="x", pady=(9, 0))
         ozet_kutu.pack_propagate(False)
-        self.log_ozet = ctk.CTkLabel(ozet_kutu, text="", text_color=UI["muted"], font=(FONT_MONO, 9),
+        self.log_ozet = ctk.CTkLabel(ozet_kutu, text="", text_color=UI["muted"],
+                                     font=(FONT_MONO, max(9, self._log_yazi_boy - 2)),
                                      anchor="w", justify="left")
         self.log_ozet.pack(fill="both", expand=True)
         # Başarısızları-tekrar tuşu: normalde gizli, koşu başarısız kişiyle bitince belirir. AYNI tuşun
@@ -916,9 +940,22 @@ class IzinGUI:
         ctk.CTkButton(ust, text="Panoya kopyala", command=self._log_panoya, width=130, height=32,
                       corner_radius=12, fg_color=UI["card"], hover_color=UI["card_hover"],
                       text_color=UI["text"], font=("Helvetica", 10, "bold")).pack(side="right", padx=(0, 12))
+        # Yazı boyu — Windows'ta 10 punto okunmuyordu (bkz. LOG_YAZI_VARSAYILAN). Seçim kalıcı.
+        boy = ctk.CTkFrame(ust, fg_color="transparent")
+        boy.pack(side="right", padx=(0, 12))
+        ctk.CTkButton(boy, text="A−", width=38, height=32, corner_radius=12, fg_color=UI["card"],
+                      hover_color=UI["card_hover"], text_color=UI["text"], font=("Helvetica", 12, "bold"),
+                      command=lambda: self._log_yazi_degistir(-1)).pack(side="left")
+        self._log_boy_lbl = ctk.CTkLabel(boy, text=str(self._log_yazi_boy), text_color=UI["subtle"],
+                                         width=26, font=("Helvetica", 10))
+        self._log_boy_lbl.pack(side="left")
+        ctk.CTkButton(boy, text="A+", width=38, height=32, corner_radius=12, fg_color=UI["card"],
+                      hover_color=UI["card_hover"], text_color=UI["text"], font=("Helvetica", 12, "bold"),
+                      command=lambda: self._log_yazi_degistir(1)).pack(side="left")
 
         txt = ctk.CTkTextbox(win, corner_radius=14, border_width=1, border_color=UI["border"],
-                             fg_color=UI["input"], text_color=UI["muted"], font=(FONT_MONO, 10),
+                             fg_color=UI["input"], text_color=UI["muted"],
+                             font=(FONT_MONO, self._log_yazi_boy),      # kullanıcının seçtiği boy
                              scrollbar_button_color=UI["card_hover"],
                              scrollbar_button_hover_color=UI["primary"])
         txt.grid(row=1, column=0, sticky="nsew", padx=14, pady=14)
@@ -1158,8 +1195,17 @@ class IzinGUI:
             self.belge_btn.configure(state="normal", text="Klasör Seç…", command=self._pick_belge)
             self.belge_info_btn.configure(state="normal")
             self.belge_entry.configure(state="normal")
-            self.belge_lbl.configure(text="Her kişinin PDF'inin bulunduğu klasörü seç.", text_color=UI["muted"])
-        self.belge_path.set("")
+            # ⚠ Uyarı BURADA da yazıyor: diyalog başlığını Windows kırpabiliyor, o zaman tek kalan bu.
+            self.belge_lbl.configure(
+                text="Her kişinin PDF'inin bulunduğu KLASÖRÜ seç. Klasör seçici dosyaları "
+                     "listelemez — PDF görmemen normal, klasörün üstüne gelip seç yeter.",
+                text_color=UI["muted"])
+        # Belge seçimi YALNIZ park gerçekten değiştiğinde sıfırlanır. _switch_module de burayı
+        # çağırıyor; koşulsuz temizlik, İZİN↔DGS sekmesine gidip gelen operatörün seçtiği klasörü
+        # sessizce uçuruyordu.
+        if getattr(self, "_son_park_kodu", None) != p.code:
+            self._son_park_kodu = p.code
+            self.belge_path.set("")
         self._set_status(f"{p.code} için kurulum hazır", "info")
 
     # ---------- Chrome / login ----------
@@ -1209,6 +1255,39 @@ class IzinGUI:
             self._set_status("Portal bağlantısı kurulamadı", "danger")
         self._log(f"[LOGIN] {res.get('reason','')}\n")
 
+    # ---------- kalıcı ayarlar ----------
+    @staticmethod
+    def _ayar_oku() -> dict:
+        try:
+            with open(AYAR_DOSYASI, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:  # noqa — dosya yok / bozuk / okunamıyor: varsayılanlarla devam
+            return {}
+
+    def _ayar_yaz(self, **kv):
+        """Tercihi diske yaz. Başarısız olursa SESSİZCE geç — ayar kaydı işi durdurmaz."""
+        self._ayarlar.update(kv)
+        try:
+            with open(AYAR_DOSYASI, "w", encoding="utf-8") as f:
+                json.dump(self._ayarlar, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    def _log_yazi_degistir(self, adim: int):
+        """Log penceresindeki A− / A+ — yazı boyunu değiştirir ve kalıcı olarak saklar."""
+        yeni = max(LOG_YAZI_ALT, min(LOG_YAZI_UST, self._log_yazi_boy + adim))
+        if yeni == self._log_yazi_boy:
+            return
+        self._log_yazi_boy = yeni
+        txt = getattr(self, "_log_win_txt", None)
+        if txt is not None:
+            self._sessizce(lambda: txt.configure(font=(FONT_MONO, yeni)))
+        etiket = getattr(self, "_log_boy_lbl", None)
+        if etiket is not None:
+            self._sessizce(lambda: etiket.configure(text=str(yeni)))
+        self._ayar_yaz(log_yazi_boy=yeni)
+
     # ---------- seçiciler ----------
     def _baslangic_klasoru(self, anahtar: str, *adaylar) -> str:
         """Dosya diyaloğu NEREDEN açılsın: en son kullanılan klasör → adaylar → ev klasörü.
@@ -1230,7 +1309,9 @@ class IzinGUI:
             self._son_klasor[anahtar] = yol
 
     def _pick_excel(self):
+        self._modal_oncesi()      # topmost log penceresi dosya diyaloğunun ÖNÜNE geçmesin
         f = filedialog.askopenfilename(
+            parent=self.root,
             title="İzin Excel'i seç",
             filetypes=EXCEL_TIPLERI,
             initialdir=self._baslangic_klasoru("izin_excel", izin_frozen.indirilenler(),
@@ -1241,11 +1322,15 @@ class IzinGUI:
             self._set_status("İzin Excel'i seçildi", "info")
 
     def _pick_belge(self):
+        # 🔴 topmost log penceresi Windows'ta YEREL dosya diyaloğunu tamamen örtebiliyor; diyalog ana
+        # pencereyi de kilitlediği için uygulama DONMUŞ görünüyor (bkz. _modal_oncesi).
+        self._modal_oncesi()
         p = self._cur_park()
         masa = izin_frozen.masaustu()
         if p.onay_pdf == "ortak":
             # ORTAK mod: park için TEK toplu PDF → dosya seçici.
             f = filedialog.askopenfilename(
+                parent=self.root,
                 title=f"{p.code} — ortak izin belgesi (tek PDF dosyası seç)",
                 filetypes=PDF_TIPLERI,
                 initialdir=self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
@@ -1255,12 +1340,40 @@ class IzinGUI:
             # ⚠ Klasör seçici tasarımı gereği DOSYA LİSTELEMEZ; kullanıcı bunu "klasörler boş"
             #   sanabiliyor. Başlıkta açıkça yazıyoruz ki PDF aramaya çalışmasın.
             f = filedialog.askdirectory(
+                parent=self.root,
                 title=f"{p.code} — PDF'lerin BULUNDUĞU KLASÖRÜ seç (dosyalar listelenmez)",
                 initialdir=self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa))
         if f:
             self.belge_path.set(f)
             self._klasoru_hatirla("belge", f, dosya_mi=(p.onay_pdf == "ortak"))
+            self._belge_secim_ozeti(p, f)
             self._set_status("Belge kaynağı seçildi", "info")
+
+    def _belge_secim_ozeti(self, park, secim: str):
+        """Seçimin HEMEN ardından "ne seçtim, içinde ne var" de — Excel beklemeden.
+
+        🔴 NEDEN: per_person modda klasör seçici kullanılıyor ve Windows'un klasör seçicisi tasarımı
+        gereği HİÇBİR DOSYA GÖSTERMEZ. Operatör PDF'lerini göremeyince "klasörler boş, yanlış yer
+        seçtim galiba" diye tereddüt ediyor. Ham PDF sayısı bu soruyu anında kapatır (Excel'e,
+        eşleştirmeye gerek yok; ayrıntılı denetim yine "Belgeleri denetle" tuşunda).
+        """
+        try:
+            if park.onay_pdf == "ortak":
+                self.belge_lbl.configure(text=f"Seçilen belge: {os.path.basename(secim)}",
+                                         text_color=UI["success"])
+                return
+            n = len(izin_belge._pdfs(secim))          # ham sayım — isim eşleştirmesi YAPMAZ
+            ad = os.path.basename(secim.rstrip(os.sep)) or secim
+            if n:
+                self.belge_lbl.configure(
+                    text=f"“{ad}” klasöründe {n} PDF bulundu. (Kimin hangi PDF'i aldığını görmek "
+                         f"için “Belgeleri denetle”.)", text_color=UI["success"])
+            else:
+                self.belge_lbl.configure(
+                    text=f"“{ad}” klasöründe hiç PDF yok — PDF'lerin DOĞRUDAN içinde olduğu "
+                         f"klasörü seç (üst klasörü değil).", text_color=UI["warning"])
+        except Exception:  # noqa — özet salt bilgi; okunamıyorsa akışı bozma
+            pass
 
     # ---------- belge denetimi (portalsız) ----------
     def _check_belge(self):
@@ -1835,7 +1948,9 @@ class IzinGUI:
 
     # ---------- DGS: seçici + öğretici popup'lar ----------
     def _pick_dgs_excel(self):
+        self._modal_oncesi()      # topmost log penceresi dosya diyaloğunun ÖNÜNE geçmesin
         f = filedialog.askopenfilename(
+            parent=self.root,
             title="DGS Excel'i seç (teknokent puantaj dosyası)",
             filetypes=EXCEL_TIPLERI,
             initialdir=self._baslangic_klasoru("dgs_excel", izin_frozen.indirilenler(),
