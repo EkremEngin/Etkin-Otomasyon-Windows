@@ -65,6 +65,12 @@ FONT_UI = "SF Pro Text" if sys.platform == "darwin" else "Segoe UI"
 FONT_DISPLAY = "SF Pro Display" if sys.platform == "darwin" else "Segoe UI"
 FONT_MONO = "SF Mono" if sys.platform == "darwin" else "Consolas"
 
+# 🔴 SÜRÜM DAMGASI — exe'nin İÇİNE gömülür. Depodaki 'Etkin Otomasyon.exe' bir BUILD ÇIKTISIDIR:
+# kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
+# Bir kez "yeni sürümü indirdim ama hiçbir şey değişmemiş" diye vakit kaybedildi (2026-09-04).
+# Bu damga arayüzün üst şeridinde ve log'un ilk satırında görünür → hangi build olduğu belli olur.
+SURUM = "2026-09-04"
+
 def _domain(url: str) -> str:
     return urllib.parse.urlsplit(url or "").netloc.lower()
 
@@ -401,6 +407,12 @@ class IzinGUI:
         self._build()
         self._switch_module("İZİN")
         self.root.after(120, self._drain_log)
+        # 🪟 WINDOWS: log penceresi AÇILIŞTA gelsin — operatör tuşu aramasın (kullanıcı isteği).
+        # macOS'ta kapalı başlar (ilk koşuda kendiliğinden açılıyor); tek satır değiştirip
+        # ikisinde de açtırabilirsin. Ana pencere çizilmeden açılamaz: konum hesabı
+        # (_ust_pencere_plani) ana pencerenin köşesini okuyor → _acilista_log_penceresi bekler.
+        if sys.platform.startswith("win"):
+            self.root.after(400, self._acilista_log_penceresi)
 
     # ---------- arayüz kurulum ----------
     def _fit_window(self):
@@ -565,6 +577,9 @@ class IzinGUI:
         ctk.CTkLabel(switcher, text="●  Kayıtlar güvenle saklanıyor", fg_color=UI["input"],
                      text_color=UI["success"], corner_radius=12, height=28,
                      font=(FONT_UI, 9, "bold")).pack(side="right", padx=14)
+        # Sürüm damgası: "yeni exe mi çalışıyor?" sorusu buradan yanıtlanır (bkz. SURUM).
+        ctk.CTkLabel(switcher, text=f"sürüm {SURUM}", text_color=UI["subtle"],
+                     font=(FONT_UI, 9)).pack(side="right", padx=(0, 12))
         # Log penceresi tuşunun İKİNCİ kopyası — bu şerit pencerenin EN ÜSTÜNDE ve `fill="x"` ile
         # paketli: pencere ne kadar küçülürse küçülsün kırpılamaz. Alt taraftaki büyük tuş kırpılsa
         # bile operatör akışa buradan ulaşır (Windows "log yok" şikâyetine karşı çift emniyet).
@@ -791,6 +806,7 @@ class IzinGUI:
         self.retry_btn = ctk.CTkButton(body, text="", command=self._retry_ac, height=38,
                                        corner_radius=14, fg_color=UI["warning"], hover_color=UI["primary_hover"],
                                        text_color="#1A1206", font=("Helvetica", 11, "bold"))
+        self._log(f"Etkin Otomasyon · sürüm {SURUM}\n")
         self._log(f"Hazır. Resume/kayıt klasörü: {DATA_DIR}\n")
         # Ekran/ölçek teşhisi: log görünmeme şikâyetinde bu satır ne olduğunu tek bakışta söyler.
         self._log(f"[EKRAN] {getattr(self, '_ekran_bilgi', '?')}\n")
@@ -830,26 +846,30 @@ class IzinGUI:
         y = py + max(0, (ph - fiz_h) // 2)
         return f"{gen}x{yuk}+{x}+{y}", int(min(taban_w, gen)), int(min(taban_h, yuk))
 
-    def _log_penceresi_ac(self, odak: bool = True):
+    def _log_penceresi_ac(self, odak: bool = True, one_getir: bool = None):
         """Canlı akış penceresi — ana pencerede log paneli YOK, akış burada okunur (bkz. _build_log).
 
-        odak=False: koşu başlarken kendiliğinden açılırken kullanılır — pencere öne gelir ama
-        klavye odağını ÇALMAZ (operatör o sırada Chrome'da login/Cloudflare ile uğraşıyor olabilir).
+        odak=False      → klavye odağını ÇALMAZ (operatör o sırada Chrome'da login/Cloudflare ile
+                          uğraşıyor olabilir). Kendiliğinden açılışlarda hep böyle çağrılır.
+        one_getir=True  → zaten açık pencereyi öne alır (odak vermeden). Koşu BAŞLARKEN istenir.
+        one_getir=False → açık pencereye hiç dokunma. İZİN tekrar-deneme ZİNCİRİNDE şart: her kişi
+                          ayrı koşu, yoksa pencere her kişide simge durumundan fırlardı.
+        Varsayılan: one_getir = odak.
         """
+        if one_getir is None:
+            one_getir = odak
         if odak:
             self._log_win_kapatildi = False                 # kullanıcı istedi → kilidi kaldır
         elif getattr(self, "_log_win_kapatildi", False):
             return                                          # kapatılmış pencereyi kendiliğinden açma
         win = getattr(self, "_log_win", None)
         if win is not None and win.winfo_exists():          # zaten açık → ikinci pencere AÇMA
-            # Öne getirme YALNIZ kullanıcı tuşa bastığında (odak=True). Kendiliğinden açılışta
-            # (koşu başlangıcı) dokunulmaz: İZİN tekrar-deneme zinciri kişi başına bir koşu açıyor,
-            # yoksa pencere her kişide simge durumundan fırlar / Chrome'un önüne geçerdi.
-            if odak:
+            if one_getir:
                 try:
                     win.deiconify()
                     win.lift()
-                    win.focus_force()
+                    if odak:
+                        win.focus_force()
                 except Exception:  # noqa
                     pass
             return
@@ -910,6 +930,27 @@ class IzinGUI:
         win.after(180, lambda: self._sessizce(win.lift))
         if odak:
             win.after(200, lambda: self._sessizce(win.focus_force))
+
+    def _acilista_log_penceresi(self, deneme: int = 0):
+        """Windows açılışı: log penceresini ana pencere ÇİZİLDİKTEN sonra aç, ana pencereyi önde bırak.
+
+        Ana pencere daha çizilmemişken açarsak `_ust_pencere_plani` onun köşesini/ölçüsünü okuyamaz
+        (winfo_width()<=1) ve pencere birincil ekrana göre konumlanır — çok monitörde yanlış ekran.
+        Bu yüzden çizilene kadar 250ms'lik aralıklarla, en fazla ~3 sn beklenir.
+
+        Sonunda ana pencere öne alınır: operatör kuruluma (park/Chrome/Excel) ondan başlıyor. Log
+        penceresi açık ve görev çubuğunda durur; koşu başlar başlamaz `_spawn` onu zaten öne alır.
+        """
+        if getattr(self, "_log_win", None) is not None or getattr(self, "_log_win_kapatildi", False):
+            return                                          # zaten açık ya da kullanıcı kapatmış
+        if self.root.winfo_width() <= 1 and deneme < 12:
+            self.root.after(250, lambda: self._acilista_log_penceresi(deneme + 1))
+            return
+        self._log_penceresi_ac(odak=False)
+        # Ana pencere önde VE odakta kalsın: yeni Toplevel'e pencere yöneticisi kendiliğinden odak
+        # verebiliyor (Windows'ta tipik). _log_penceresi_ac'ın 180ms'lik lift'inden SONRA çalışsın.
+        self.root.after(260, lambda: (self._sessizce(self.root.lift),
+                                      self._sessizce(self.root.focus_force)))
 
     @staticmethod
     def _sessizce(fn):
@@ -1956,9 +1997,12 @@ class IzinGUI:
 
     def _spawn(self, cmd: list, calisiyor_mesaji: str):
         """Motoru ALT-SÜREÇ olarak koş — İZİN ve DGS ortak. Çıktısı canlı log'a akar."""
-        # Akış ana pencerede DEĞİL (bkz. _build_log) → koşu başlarken log penceresini kendiliğinden aç.
+        # Akış ana pencerede DEĞİL (bkz. _build_log) → koşu başlarken log penceresini aç ve ÖNE al.
         # odak=False: operatör o an Chrome'da login/Cloudflare ile uğraşıyor olabilir, klavyeyi çalma.
-        self._sessizce(lambda: self._log_penceresi_ac(odak=False))
+        # one_getir: yalnız YENİ bir koşuda. İZİN tekrar-deneme zinciri kişi başına bir _spawn açıyor
+        # (_izin_retry_aktif dolu) — orada öne almazsak pencere her kişide ekrana fırlamamış olur.
+        self._sessizce(lambda: self._log_penceresi_ac(odak=False,
+                                                      one_getir=self._izin_retry_aktif is None))
         self._log("\n$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
         self._son_hatalar = []               # bu koşunun başarısızları taze toplanır (run bitince değerlendirilir)
         self._son_manuel = []                # kapanış sonu MANUEL giriş gereken kişiler [{"ad","sebep"}]
