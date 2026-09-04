@@ -75,3 +75,10 @@ EtkinOtomasyon
 # Windows derlenmiş exe — kullanıcı kararı: repoda bulunsun (operatör direkt indirip çalıştırır).
 # SADECE bu tek dosya; başka .exe girmesin diye tam ad + kök çıpası (/) ile.
 !/Etkin Otomasyon.exe
+
+# GitHub Actions — Windows exe'sini GitHub'ın kendi Windows makinesi derliyor (bkz. workflow başlığı).
+# ⚠ SIRA: yukarıdaki '*' her şeyi yasakladığı için git ignore'lanmış bir KLASÖRE HİÇ GİRMEZ.
+# Bu yüzden önce klasörler, sonra dosya deseni açılmak zorunda — Codes/assets/ ile aynı numara.
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml

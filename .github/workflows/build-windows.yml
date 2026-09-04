@@ -1,0 +1,75 @@
+name: Windows exe
+
+# NEDEN VAR: 'Etkin Otomasyon.exe' bir BUILD ÇIKTISIDIR — kodu güncelleyip depoyu yenilemek onu
+# DEĞİŞTİRMEZ, içine build günündeki Python kodu gömülüdür. PyInstaller çapraz derleme yapmadığı için
+# exe ancak bir Windows makinede üretilebilir. Bu iş akışı o makineyi GitHub'dan kiralar: her push'ta
+# exe'yi derler, açılıp açılmadığını sınar ve indirilebilir bir dosya olarak bırakır.
+#
+# NASIL İNDİRİLİR: depo sayfası → üstteki "Actions" sekmesi → en üstteki koşu → sayfanın altındaki
+# "Artifacts" kutusundan "Etkin-Otomasyon-exe". GitHub artifact'ları ZIP'ler; indirip çıkart, içinden
+# 'Etkin Otomasyon.exe' çıkar. Onu proje KÖKÜNE koy (Codes'un yanına), 'dist' klasöründen çalıştırma:
+# uygulama resume/done dosyalarını kendi durduğu klasöre yazar, yanlış klasör = MÜKERRER PORTAL KAYDI.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Codes/**'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:        # Actions sekmesinden elle de başlatılabilir ("Run workflow")
+
+jobs:
+  build:
+    runs-on: windows-latest         # ŞART: .exe yalnız Windows'ta derlenir
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'    # 3.12+ gerekli; python.org dağıtımı (tkinter dahil gelir)
+
+      - name: Bağımlılıklar
+        working-directory: Codes
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller -r requirements.txt
+        # ⚠ '-r requirements.txt' ŞART: spec collect_all('customtkinter') çağırıyor, paketleri
+        # tek tek kurmak yetmiyor. playwright TARAYICI indirmez (Chrome'a CDP ile bağlanıyoruz).
+
+      - name: Hangi sürüm derleniyor?
+        working-directory: Codes
+        shell: python
+        run: |
+          import io, re
+          k = io.open('izin_gui.py', encoding='utf-8').read()
+          m = re.search(r'SURUM\s*=\s*"([^"]+)"', k)
+          print('SURUM =', m.group(1) if m else 'BULUNAMADI')
+        # Bu satır koşu log'una düşer → indirilen exe'nin hangi koda karşılık geldiği kayda geçer.
+
+      - name: Derle
+        working-directory: Codes
+        run: pyinstaller izin_app.spec --noconfirm
+        # working-directory ŞART: spec 'assets/...' yollarını CWD'ye göre çözüyor, başka klasörden patlar.
+
+      - name: Duman testi — exe açılıyor mu, kalıcı klasörü doğru mu?
+        working-directory: Codes
+        shell: pwsh
+        run: |
+          $exe = "dist\Etkin Otomasyon.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "exe üretilmedi: $exe" }
+          "boyut: {0:N1} MB" -f ((Get-Item -LiteralPath $exe).Length / 1MB)
+          # console=False (pencereli) exe olduğu için çıktısı konsola DÜŞMEZ; ölçtüğümüz şey çıkış kodu.
+          # 'paths' token'ı GUI açmadan çalışır: donmuş exe kendini import edip dispatcher'a gider.
+          # Sıfırdan farklı çıkış = eksik hidden import / bozuk bundle demektir (PyInstaller'ın en sık hatası).
+          $p = Start-Process -FilePath $exe -ArgumentList "paths" -Wait -PassThru -NoNewWindow
+          "çıkış kodu: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "exe 'paths' ile $($p.ExitCode) koduyla düştü — bundle bozuk." }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Etkin-Otomasyon-exe
+          path: 'Codes/dist/Etkin Otomasyon.exe'
+          if-no-files-found: error   # sessizce boş artifact bırakma
+          retention-days: 30
