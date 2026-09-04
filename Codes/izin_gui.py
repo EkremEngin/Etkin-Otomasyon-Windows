@@ -206,6 +206,12 @@ UI = {
     "danger_hover": "#5A2A31",
 }
 
+# Canlı log renkleri — log penceresi ve ana penceredeki tek satırlık önizleme aynı sözlüğü kullanır.
+_LOG_RENK = {"success": UI["success"], "warning": UI["warning"],
+             "danger": UI["danger"], "command": UI["cyan"]}
+# Bellekte tutulan en fazla log parçası (pencere kapalıyken de birikir). TAM kayıt gui_canli_log.txt'de.
+LOG_TAVAN = 4000
+
 
 # ==========================================================================
 # Chrome başlatma (çapraz-platform)
@@ -253,6 +259,57 @@ def launch_chrome(portal_url: str) -> tuple[bool, str]:
     except Exception as e:  # noqa
         return False, f"Chrome başlatılamadı: {e}"
     return True, "Chrome açılıyor — pencerede login ol + Cloudflare'i geç."
+
+
+# ==========================================================================
+# Pencere ölçüsü — DPI hesabı (Windows'ta canlı log panelini kaçıran hata buradaydı)
+# ==========================================================================
+# Arayüz bu MANTIKSAL boyuta göre çizildi (kart genişlikleri, wraplength'ler, sağdaki kartlar).
+# NOT: canlı log artık ana pencerede DEĞİL, ayrı pencerede (bkz. IzinGUI._build_log) — ana pencerenin
+# yükseklik ihtiyacı eskisinden düşük. Alt pencereler ayrıca `_ust_pencere_plani` ile ekrana sığdırılır.
+TASARIM_W, TASARIM_H = 1420, 920
+
+
+def pencere_plani(sw: int, sh: int, dpi: float, win: bool) -> dict:
+    """Ekrana SIĞAN pencere planı: ölçek çarpanı + mantıksal boyut + konum + minsize.
+
+    🔴 WINDOWS TUZAĞI (canlı log görünmüyordu): CustomTkinter `geometry()` ve `minsize()`
+    değerlerini ekranın DPI çarpanıyla ÇARPAR (Windows %150 ölçek → 1.5×). Eski kod ölçüyü
+    FİZİKSEL pikselle veriyordu (1420x920) → pencere 2130x1380 açılıyor, sağ sütunun DİBİNDEKİ
+    canlı log paneli ekranın/görev çubuğunun altında kalıyordu. minsize de (1100x760 → 1650x1140)
+    şiştiği için kullanıcı pencereyi küçültüp log'u geri getiremiyordu. macOS'ta dpi=1 olduğundan
+    sorun hiç görünmedi — bu yüzden yalnız Windows'ta çıktı.
+
+    Çözüm: (1) çalışma alanı fiziksel piksel olarak hesaplanır (görev çubuğu + başlık payı düşülür),
+    (2) tasarım oraya sığmıyorsa ÖLÇEK kısılır — yazı ve widget BİRLİKTE küçülür, oran bozulmaz,
+    (3) geometry'ye ölçeğe BÖLÜNMÜŞ mantıksal değer verilir → fiziksel sonuç tam çalışma alanı kadar.
+    """
+    # Görev çubuğu / menü çubuğu + pencere başlığı payı — Tk çalışma alanını doğrudan vermiyor.
+    if win:
+        yatay_pay, dikey_pay = int(48 * dpi), int(96 * dpi)   # kenarlar + görev çubuğu + başlık
+    else:
+        yatay_pay, dikey_pay = 64, 120                        # menü çubuğu + Dock
+    alan_w, alan_h = max(640, sw - yatay_pay), max(480, sh - dikey_pay)
+
+    # Tasarım çalışma alanına sığmıyorsa ölçeği kıs (0.7 = okunabilirlik tabanı).
+    olcek = max(0.7, min(dpi, alan_w / TASARIM_W, alan_h / TASARIM_H))
+
+    genislik = int(min(TASARIM_W, alan_w / olcek))
+    yukseklik = int(min(TASARIM_H, alan_h / olcek))
+    return {
+        "olcek": olcek,
+        "genislik": genislik,
+        "yukseklik": yukseklik,
+        "x": max(0, (sw - int(genislik * olcek)) // 2),
+        "y": max(0, (sh - int(yukseklik * olcek)) // 2),
+        # Minsize de MANTIKSAL birimde (CTk ölçekle çarpacak). 760 tabanı ölçüldü: bunun altında
+        # sağ sütun kısalıyor ve canlı log kartı kırpılmaya başlıyor.
+        "min_w": int(min(1120, alan_w / olcek)),
+        "min_h": int(min(760, alan_h / olcek)),
+        # Ekran 0.7 tabanında bile dar: Windows'ta tam ekran aç → görev çubuğunu WM'in kendisi
+        # hesaplar, alt paneller kesin kesilmez.
+        "dar": win and (alan_w < TASARIM_W * 0.7 or alan_h < TASARIM_H * 0.7),
+    }
 
 
 # ==========================================================================
@@ -311,8 +368,23 @@ class IzinGUI:
         # Başarısız kişi takibi: motor "!! BAŞARISIZ: <ad> — <sebep>" bastıkça toplanır; run bitince
         # (yalnız GERÇEK DGS-giriş koşularında) "tekrar dene" penceresi açılır. _retry_baglami None ise teklif yok.
         self._son_hatalar: "list[dict]" = []      # [{"ad","mesaj"}]
-        self._retry_baglami = None                # {"park","excel","onayla","destek"} | None
+        self._retry_baglami = None                # {"modul","park",…} | None  → "Tekrar Dene" tuşunun bağlamı
         self._kapanis_asamasi = False             # True iken biten koşu KAPANIŞ'tır → tekrar kapanış tetikleme
+        # İZİN tekrar-denemesi kişi kişi koşar: motorun --person'u TEK ad alıyor (izin_otomasyon.py:110),
+        # liste dosyası yok. Bu yüzden seçilen adlar kuyruğa alınır, her koşu bitince sıradaki başlar.
+        self._izin_retry_kuyruk: "list[str]" = []
+        self._izin_retry_aktif = None             # şu an denenen ad (koşu bitince sonucu buna yazılır)
+        self._izin_retry_sonuc: "list[dict]" = []  # [{"ad","ok","mesaj"}] → zincir sonunda özet
+
+        # Log GEÇMİŞİ bellekte tutulur: akış artık ana pencerede DEĞİL, ayrı pencerede gösteriliyor
+        # (neden: _build_log). Pencere kapalıyken de birikir, açılınca oraya dökülür. Tavanlı liste.
+        self._log_gecmis: "list[tuple[str, str | None]]" = []
+        self._log_win = None            # açık log penceresi (CTkToplevel) | None
+        self._log_win_txt = None        # o pencerenin metin kutusu | None
+        self._log_retry_btn = None      # log penceresindeki "tekrar dene" tuşu | None
+        self._log_ustte = None          # "en üstte tut" anahtarı (pencere açılınca kurulur) | None
+        self._log_win_kapatildi = False  # operatör pencereyi bilerek kapattı mı? (otomatik açmayı susturur)
+        self._retry_durum = None        # {"toplam","denenebilir"} | None → iki retry tuşunun ortak durumu
 
         # Canlı log'un DOSYA kopyası — gözetimli testte Claude `tail -f` ile birebir izler
         # (ekran görüntüsü izni gerekmez). Her açılışta ayraç atılır; dosya DATA_DIR'de kalır.
@@ -332,20 +404,41 @@ class IzinGUI:
 
     # ---------- arayüz kurulum ----------
     def _fit_window(self):
-        """Ekrana taşmayan, ortalanmış başlangıç boyutu (13" Mac ve Windows laptop dahil)."""
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width = min(1420, max(1120, sw - 96))
-        height = min(920, max(760, sh - 120))
-        x = max(0, (sw - width) // 2)
-        y = max(0, (sh - height) // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(min(1100, sw - 40), min(760, sh - 80))
+        """Ekrana taşmayan, ortalanmış başlangıç boyutu (13" Mac ve Windows laptop dahil).
+
+        Hesabın tamamı ve Windows'taki DPI tuzağı için: `pencere_plani` docstring'i.
+        """
+        root = self.root
+        try:
+            # Ekranın DPI çarpanı: macOS → 1, Windows %125 → 1.25, %150 → 1.5.
+            dpi = float(ctk.ScalingTracker.window_dpi_scaling_dict.get(root, 1.0)) or 1.0
+        except Exception:
+            dpi = 1.0
+        p = pencere_plani(root.winfo_screenwidth(), root.winfo_screenheight(), dpi,
+                          sys.platform.startswith("win"))
+        self._olcek = p["olcek"]                      # kart/log ölçüleri de bunu kullanır
+        # CTk'nin uyguladığı çarpan = DPI × buradaki global çarpan → hedef ölçeğe BÖLEREK ayarla.
+        ctk.set_widget_scaling(p["olcek"] / dpi)
+        ctk.set_window_scaling(p["olcek"] / dpi)
+        root.geometry(f"{p['genislik']}x{p['yukseklik']}+{p['x']}+{p['y']}")
+        root.minsize(p["min_w"], p["min_h"])
+        # Log'a basılır: "log görünmüyor" şikâyetinde hangi ekranda ne hesaplandığı tek satırda belli olsun.
+        self._ekran_bilgi = (f"{root.winfo_screenwidth()}x{root.winfo_screenheight()} · dpi={dpi:g} · "
+                             f"ölçek={p['olcek']:.2f} · pencere={int(p['genislik'] * p['olcek'])}"
+                             f"x{int(p['yukseklik'] * p['olcek'])} · {sys.platform}")
+        if p["dar"]:
+            try:
+                root.state("zoomed")                 # yalnız Windows; başka yerde TclError → yut
+            except Exception:
+                pass
 
     def _configure_styles(self):
-        """Platform ölçeklemesini koruyan ortak CustomTkinter görünümü."""
+        """Ortak CustomTkinter görünümü.
+
+        ⚠️ Ölçek (widget/window scaling) BURADA AYARLANMAZ — `_fit_window` ekrana göre hesaplar.
+        Buraya sabit 1.0 yazmak Windows'ta o hesabı eziyordu (bkz. `pencere_plani`).
+        """
         ctk.set_appearance_mode("dark")
-        ctk.set_widget_scaling(1.0)
-        ctk.set_window_scaling(1.0)
 
     def _card(self, parent, number: str, title: str, subtitle: str):
         """Başlığı, numara rozeti ve ince çerçevesi olan yeniden kullanılabilir kart."""
@@ -472,6 +565,14 @@ class IzinGUI:
         ctk.CTkLabel(switcher, text="●  Kayıtlar güvenle saklanıyor", fg_color=UI["input"],
                      text_color=UI["success"], corner_radius=12, height=28,
                      font=(FONT_UI, 9, "bold")).pack(side="right", padx=14)
+        # Log penceresi tuşunun İKİNCİ kopyası — bu şerit pencerenin EN ÜSTÜNDE ve `fill="x"` ile
+        # paketli: pencere ne kadar küçülürse küçülsün kırpılamaz. Alt taraftaki büyük tuş kırpılsa
+        # bile operatör akışa buradan ulaşır (Windows "log yok" şikâyetine karşı çift emniyet).
+        self._ust_log_btn = ctk.CTkButton(switcher, text="⧉  Canlı log", command=self._log_penceresi_ac,
+                                          width=120, height=28, corner_radius=12, fg_color=UI["input"],
+                                          hover_color=UI["card_hover"], text_color=UI["cyan"],
+                                          font=(FONT_UI, 9, "bold"))
+        self._ust_log_btn.pack(side="right")
 
         # İş akışı şeridi (modüle göre yeniden çizilir)
         flow = ctk.CTkFrame(shell, fg_color=UI["surface"], corner_radius=16,
@@ -508,19 +609,26 @@ class IzinGUI:
         for view in (self.izin_view, self.dgs_view):
             view.grid(row=0, column=0, sticky="nsew")
 
-        right = ctk.CTkFrame(body, fg_color="transparent")
+        self.right = right = ctk.CTkFrame(body, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=0)                     # çalıştır: doğal boyu
-        right.rowconfigure(1, weight=1)                     # log: kalan tüm alanı yer
+        # 🔴 SATIR AĞIRLIKLARI TERSİNE ÇEVRİLDİ (Windows'ta log görünmüyordu — bkz. _build_log):
+        # Tk grid, alan yetmediğinde açığın TAMAMINI ağırlıklı satırdan kısar. Eskiden ağırlık
+        # LOG'daydı → dar ekranda log kırpılıp yok oluyordu. Artık ağırlık ÇALIŞTIR kartında:
+        # yer daralınca onun ALTI kırpılır (BAŞLAT tuşu kartın en üstünde, hep görünür), log
+        # kartı ise ağırlıksız olduğu için doğal boyunu KORUR ve asla kaybolmaz.
+        # minsize TABANI: kart ezilip BAŞLAT tuşu kaybolmasın. DGS kartında tuşun ÜSTÜNDE bir de
+        # uyarı satırı var (kart başlığı ~60 + uyarı ~2 satır + tuş 44 + pay) → 130 yetmiyordu.
+        right.rowconfigure(0, weight=1, minsize=int(180 * getattr(self, "_olcek", 1.0)))
+        right.rowconfigure(1, weight=0)                     # log kartı: sabit boy, dokunulmaz
 
         # Çalıştır sahnesi — her modülün kendi kartı (üst üste; modül seçicisiyle değişir)
         self.run_stage = ctk.CTkFrame(right, fg_color="transparent")
-        self.run_stage.grid(row=0, column=0, sticky="nsew", pady=(0, 14))
+        self.run_stage.grid(row=0, column=0, sticky="nsew")
         self.run_stage.rowconfigure(0, weight=1)
         self.run_stage.columnconfigure(0, weight=1)
 
-        # Canlı log — PAYLAŞILAN, sahnelerin dışında: modül değişince akış kesilmez.
+        # Log KARTI — PAYLAŞILAN (sahne dışında; modül değişince akış kesilmez).
         self._build_log(right)
 
         content = self.izin_view                            # İZİN kurulum kartları buraya dikey yığılır
@@ -647,24 +755,218 @@ class IzinGUI:
         self._build_dgs()
 
     def _build_log(self, parent):
-        """Canlı log — İZİN ve DGS'in PAYLAŞTIĞI tek panel (sahne dışında; modül değişince silinmez)."""
-        card, body = self._card(parent, "LIVE", "Canlı işlem akışı", "Komutlar ve sonuçlar burada görünür")
-        card.grid(row=1, column=0, sticky="nsew")           # sağ sütunun kalan tüm yüksekliği
-        self.log = ctk.CTkTextbox(body, corner_radius=14, border_width=1, border_color=UI["border"],
-                                  fg_color=UI["input"], text_color=UI["muted"], font=(FONT_MONO, 10),
-                                  scrollbar_button_color=UI["card_hover"], scrollbar_button_hover_color=UI["primary"])
-        self.log.pack(fill="both", expand=True)
-        self.log._textbox.tag_configure("success", foreground=UI["success"])
-        self.log._textbox.tag_configure("warning", foreground=UI["warning"])
-        self.log._textbox.tag_configure("danger", foreground=UI["danger"])
-        self.log._textbox.tag_configure("command", foreground=UI["cyan"])
-        # Başarısızları-tekrar tuşu: log'un HEMEN ALTINDA durur, DGS koşusu başarısızla bitince belirir
-        # (normalde gizli). Tıklayınca "Kaydedilemeyen kişiler" penceresini yeniden açar (sebep + Tekrar Dene).
-        # Popup'ı kapatsan da burada kalır → kalıcı erişim. Yeni koşu / modül değişince gizlenir.
+        """Log KARTI — akışın KENDİSİ ayrı pencerede gösterilir; ana pencerede yalnız bu kart durur.
+
+        🔴 NEDEN AYRI PENCERE (Windows'ta "log görünmüyor" şikâyeti):
+        Log paneli sağ sütunun DİBİNDEYDİ. Tk grid alan yetmediğinde açığın tamamını ağırlıklı
+        satırdan kısar; dar/yüksek-DPI Windows ekranında "Çalıştır" kartı sütunun tamamını yiyor,
+        log gövdesi pencerenin dışında kalıyordu. Önce DPI hesabı (`pencere_plani`), sonra çalıştır
+        kartına yükseklik tavanı konarak dengelenmeye çalışıldı — Windows'ta yine görünmedi
+        (o tavan kodu, `_sag_sutun_dengele`, artık gereksiz olduğu için SİLİNDİ).
+
+        Kesin çözüm: log ana pencerede HİÇ yer kaplamasın. Bu kart sabit boyludur (ağırlıksız satır →
+        asla kırpılmaz) ve tek işi log penceresini açmaktır. Pencerenin boyu ekrana göre hesaplanır
+        (`_ust_pencere_plani`), yani kaç ölçekli ekran olursa olsun tamamı görünür.
+        """
+        card, body = self._card(parent, "LIVE", "Canlı işlem akışı",
+                                "Akış ayrı pencerede görünür — koşu başlayınca kendiliğinden açılır")
+        card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        self.log_btn = ctk.CTkButton(body, text="⧉   CANLI LOG'U AÇ", command=self._log_penceresi_ac,
+                                     height=44, corner_radius=16, fg_color=UI["primary"],
+                                     hover_color=UI["primary_hover"], text_color="white",
+                                     font=("Helvetica", 11, "bold"))
+        self.log_btn.pack(fill="x")
+        # Tek satırlık önizleme: log penceresi kapalıyken de "yaşıyor mu, nerede?" sorusunu yanıtlar.
+        # ⚠️ SABİT BOYUTLU KUTU İÇİNDE: çıplak etiket, uzun satırda kendi istediği genişliği büyütüp
+        # sağ sütunu (dolayısıyla tüm ızgarayı) her log satırında oynatıyordu. propagate kapalı kutu
+        # etiketin ölçüsünü dışarı sızdırmaz — sütun genişliği log metnine göre zıplamaz.
+        ozet_kutu = ctk.CTkFrame(body, fg_color="transparent", height=18)
+        ozet_kutu.pack(fill="x", pady=(9, 0))
+        ozet_kutu.pack_propagate(False)
+        self.log_ozet = ctk.CTkLabel(ozet_kutu, text="", text_color=UI["muted"], font=(FONT_MONO, 9),
+                                     anchor="w", justify="left")
+        self.log_ozet.pack(fill="both", expand=True)
+        # Başarısızları-tekrar tuşu: normalde gizli, koşu başarısız kişiyle bitince belirir. AYNI tuşun
+        # bir kopyası log penceresinde de var (bkz. _retry_btnleri_tazele) — operatör hangisine bakıyorsa.
         self.retry_btn = ctk.CTkButton(body, text="", command=self._retry_ac, height=38,
                                        corner_radius=14, fg_color=UI["warning"], hover_color=UI["primary_hover"],
                                        text_color="#1A1206", font=("Helvetica", 11, "bold"))
         self._log(f"Hazır. Resume/kayıt klasörü: {DATA_DIR}\n")
+        # Ekran/ölçek teşhisi: log görünmeme şikâyetinde bu satır ne olduğunu tek bakışta söyler.
+        self._log(f"[EKRAN] {getattr(self, '_ekran_bilgi', '?')}\n")
+
+    def _ust_pencere_plani(self, ist_w: int, ist_h: int, taban_w: int = 420, taban_h: int = 300,
+                           hiza: str = "orta"):
+        """CTkToplevel için ekrana SIĞAN (geometry, min_w, min_h) — üçü de MANTIKSAL birimde.
+
+        🔴 CTk `geometry()` ve `minsize()` verilen değeri pencere ölçeğiyle ÇARPAR (ayrıntı:
+        `pencere_plani`). Sabit "780x700" bu yüzden %150 ölçekli Windows'ta 1170x1050 FİZİKSEL
+        piksele çıkıyor; 1080p ekranda pencerenin altı (kapat/kaydet tuşları) görev çubuğunun
+        altında kalıyordu — ana penceredeki log sorununun aynısı, alt pencerelerde.
+
+        Burada istenen boy önce fiziksel çalışma alanına kırpılır, sonra ölçeğe BÖLÜNÜP mantıksal
+        değere çevrilir. x/y ölçeklenmez (CTk onlara dokunmuyor) → ham piksel verilir.
+
+        🔴 KONUM ANA PENCEREYE GÖRE: `winfo_screenwidth()` yalnız BİRİNCİL ekranı bilir. Konumu ona
+        göre hesaplarsak, ana pencere ikinci monitördeyken alt pencere BAŞKA EKRANDA açılır ve
+        operatör onu hiç görmez (log penceresinde bu tam olarak asıl şikâyetin tekrarı olurdu).
+        Bu yüzden x/y ana pencerenin köşesinden türetilir → alt pencere hep aynı ekranda kalır.
+        """
+        olcek = getattr(self, "_olcek", 1.0) or 1.0
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        alan_w = max(360, sw - int(60 * olcek))                 # kenar payı
+        alan_h = max(260, sh - int(120 * olcek))                # görev/menü çubuğu + başlık payı
+        gen = max(1, int(min(ist_w, alan_w / olcek)))
+        yuk = max(1, int(min(ist_h, alan_h / olcek)))
+        fiz_w, fiz_h = int(gen * olcek), int(yuk * olcek)
+        # Ana pencerenin köşesi ve ölçüsü — konumun dayanağı (yukarıdaki "çok monitör" notu).
+        px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+        pw, ph = self.root.winfo_width(), self.root.winfo_height()
+        if pw <= 1 or ph <= 1:                                  # pencere henüz çizilmediyse ekrana göre
+            px, py, pw, ph = 0, 0, sw, sh
+        # hiza="sol": ana pencerenin SOL kenarına yaslanır → sağ sütun (BAŞLAT/DURDUR ve log kartı)
+        # açıkta kalır; operatör koşuyu izlerken durdurmak için pencere sürüklemek zorunda kalmaz.
+        x = px if hiza == "sol" else px + max(0, (pw - fiz_w) // 2)
+        y = py + max(0, (ph - fiz_h) // 2)
+        return f"{gen}x{yuk}+{x}+{y}", int(min(taban_w, gen)), int(min(taban_h, yuk))
+
+    def _log_penceresi_ac(self, odak: bool = True):
+        """Canlı akış penceresi — ana pencerede log paneli YOK, akış burada okunur (bkz. _build_log).
+
+        odak=False: koşu başlarken kendiliğinden açılırken kullanılır — pencere öne gelir ama
+        klavye odağını ÇALMAZ (operatör o sırada Chrome'da login/Cloudflare ile uğraşıyor olabilir).
+        """
+        if odak:
+            self._log_win_kapatildi = False                 # kullanıcı istedi → kilidi kaldır
+        elif getattr(self, "_log_win_kapatildi", False):
+            return                                          # kapatılmış pencereyi kendiliğinden açma
+        win = getattr(self, "_log_win", None)
+        if win is not None and win.winfo_exists():          # zaten açık → ikinci pencere AÇMA
+            # Öne getirme YALNIZ kullanıcı tuşa bastığında (odak=True). Kendiliğinden açılışta
+            # (koşu başlangıcı) dokunulmaz: İZİN tekrar-deneme zinciri kişi başına bir koşu açıyor,
+            # yoksa pencere her kişide simge durumundan fırlar / Chrome'un önüne geçerdi.
+            if odak:
+                try:
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                except Exception:  # noqa
+                    pass
+            return
+
+        win = ctk.CTkToplevel(self.root, fg_color=UI["bg"])
+        win.title("Canlı işlem akışı — Etkin Otomasyon")
+        geo, min_w, min_h = self._ust_pencere_plani(1000, 660, 460, 320, hiza="sol")
+        win.geometry(geo)
+        win.minsize(min_w, min_h)
+        # transient KULLANILMIYOR: operatör bu pencereyi ikinci ekrana taşıyabilsin, ana pencereyle
+        # birlikte küçülmesin. Chrome'un arkasında kaybolmaması için "En üstte tut" anahtarı var.
+
+        # ⚠️ GRID (pack DEĞİL): pack, metin kutusuna sırayla yer verdiği için pencere asgari boya
+        # inince DİPTEKİ tuş 42px yerine ~12px'e eziliyordu. Grid'de ağırlık metin kutusunda:
+        # daralan tek şey o; başlık şeridi ve tuş doğal boylarını korur (ana penceredeki ders).
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=0)                       # başlık şeridi
+        win.rowconfigure(1, weight=1, minsize=80)           # akış (daralan taraf)
+        win.rowconfigure(2, weight=0)                       # "kaydedilemedi" tuşu
+
+        ust = ctk.CTkFrame(win, fg_color=UI["surface"], corner_radius=16)
+        ust.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 0))
+        ctk.CTkLabel(ust, text="CANLI İŞLEM AKIŞI", text_color=UI["text"],
+                     font=(FONT_DISPLAY, 13, "bold")).pack(side="left", padx=16, pady=12)
+        self._log_ustte = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(ust, text="En üstte tut", variable=self._log_ustte, corner_radius=6,
+                        command=self._log_win_ustte_uygula, border_color=UI["primary"],
+                        fg_color=UI["primary"], hover_color=UI["primary_hover"],
+                        text_color=UI["muted"], font=("Helvetica", 10)).pack(side="right", padx=(0, 16))
+        ctk.CTkButton(ust, text="Panoya kopyala", command=self._log_panoya, width=130, height=32,
+                      corner_radius=12, fg_color=UI["card"], hover_color=UI["card_hover"],
+                      text_color=UI["text"], font=("Helvetica", 10, "bold")).pack(side="right", padx=(0, 12))
+
+        txt = ctk.CTkTextbox(win, corner_radius=14, border_width=1, border_color=UI["border"],
+                             fg_color=UI["input"], text_color=UI["muted"], font=(FONT_MONO, 10),
+                             scrollbar_button_color=UI["card_hover"],
+                             scrollbar_button_hover_color=UI["primary"])
+        txt.grid(row=1, column=0, sticky="nsew", padx=14, pady=14)
+        for ad, renk in _LOG_RENK.items():
+            txt._textbox.tag_configure(ad, foreground=renk)
+        # "Kaydedilemedi" tuşu — log penceresinin DİBİNDE. Koşuyu buradan izleyen operatör tekrar
+        # denemek için ana pencereye dönmek zorunda kalmasın. Normalde gizli (_retry_btnleri_tazele).
+        self._log_retry_btn = ctk.CTkButton(win, text="", command=self._log_win_retry, height=42,
+                                            corner_radius=14, fg_color=UI["warning"],
+                                            hover_color=UI["primary_hover"], text_color="#1A1206",
+                                            font=("Helvetica", 11, "bold"))
+        try:
+            for parca, tg in self._log_gecmis:              # o ana kadarki akışı (renkleriyle) dök
+                txt.insert("end", parca, tg)
+            txt.see("end")
+        except Exception:  # noqa
+            pass
+        self._log_win, self._log_win_txt = win, txt
+        win.protocol("WM_DELETE_WINDOW", self._log_penceresi_kapat)
+        self._retry_btnleri_tazele()                        # açık bir başarısız-koşu varsa tuş hemen çıksın
+        # CTkToplevel bazen ana pencerenin ALTINDA açılıyor → gecikmeli lift. Pencere bu arada
+        # kapatılmış olabilir, ikisi de _sessizce ile sarılı.
+        win.after(180, lambda: self._sessizce(win.lift))
+        if odak:
+            win.after(200, lambda: self._sessizce(win.focus_force))
+
+    @staticmethod
+    def _sessizce(fn):
+        """Pencere kullanıcı tarafından kapatılmış olabilir — after() geri çağrıları patlamasın."""
+        try:
+            fn()
+        except Exception:  # noqa
+            pass
+
+    def _log_penceresi_kapat(self):
+        """Log penceresi kapandı: canlı yazma hedeflerini temizle (yoksa yok edilmiş widget'a yazarız)."""
+        win = getattr(self, "_log_win", None)
+        self._log_win = self._log_win_txt = self._log_retry_btn = None
+        # Operatör pencereyi BİLEREK kapattı → koşu başlangıçları onu zorla geri açmasın. İZİN
+        # tekrar-deneme zinciri kişi başına bir koşu açıyor; bayrak olmasa pencere her kişide
+        # yeniden ekrana fırlardı. Kilidi yalnız kullanıcı tuşa basınca (odak=True) kalkar.
+        self._log_win_kapatildi = True
+        if win is not None:
+            self._sessizce(win.destroy)
+
+    def _modal_oncesi(self):
+        """Modal (grab_set / messagebox) açmadan ÖNCE log penceresinin 'en üstte' kilidini kaldır.
+
+        🔴 NEDEN: '-topmost' pencere, grab_set'li modal'ın ÜSTÜNDE kalıyor. Modal tüm tıklamaları
+        yuttuğu için operatör ne modal'ı görebiliyor ne de log penceresine tıklayabiliyordu →
+        uygulama DONMUŞ gibi. Özellikle log penceresindeki 'TEKRAR DENE' tuşunda: onay kutusu
+        pencerenin arkasında açılıyordu. Kutucuğu da temizliyoruz ki arayüz yalan söylemesin.
+        """
+        if getattr(self, "_log_ustte", None) is not None and self._log_ustte.get():
+            self._log_ustte.set(False)
+            self._log_win_ustte_uygula()
+
+    def _log_win_ustte_uygula(self):
+        """'En üstte tut' — Chrome otomasyonu öne geçtiğinde log penceresi arkada kaybolmasın."""
+        win = getattr(self, "_log_win", None)
+        if win is None or not win.winfo_exists():
+            return
+        self._sessizce(lambda: win.attributes("-topmost", bool(self._log_ustte.get())))
+
+    def _log_panoya(self):
+        """Bellekteki tüm akışı panoya kopyala (hata paylaşırken ekran görüntüsü uğraşı olmasın)."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("".join(p for p, _ in self._log_gecmis))
+            self._set_status("Log panoya kopyalandı", "info")
+        except Exception:  # noqa
+            pass
+
+    def _log_win_retry(self):
+        """Log penceresindeki tuş: bağlam varsa DOĞRUDAN tekrar-deneme (onay kutusu yine çıkar),
+        yoksa 'kaydedilemeyen kişiler' penceresini açıp sebepleri gösterir."""
+        b = self._retry_baglami
+        denenebilir = [h["ad"] for h in self._son_hatalar if self._hata_yorumla(h["mesaj"])[1]]
+        if b and denenebilir:
+            (self._izin_retry if b.get("modul") == "izin" else self._dgs_retry)(denenebilir, None)
+        else:
+            self._retry_ac()
 
     # ---------- modül geçişi ----------
     _FLOW = {
@@ -711,18 +1013,46 @@ class IzinGUI:
         # --- YEDEK: return data.PARKS[self.park.get()]
         return data.PARKS[IZIN_DISPLAY_TO_CODE[self.park.get()]]
 
-    def _log(self, s: str):
-        tag = None
-        if s.lstrip().startswith("$"):
-            tag = "command"
-        elif "⚠" in s:
-            tag = "warning"
-        elif "!!" in s or "hata" in s.lower():
-            tag = "danger"
-        elif "✓" in s or "bitti" in s.lower():
-            tag = "success"
-        self.log.insert("end", s, tag)
-        self.log.see("end")
+    def _log(self, s: str, tag: str = None):
+        """Akışa bir parça yaz: bellek geçmişi + açık log penceresi + önizleme + dosya.
+
+        tag verilirse renk ZORLANIR (koşu sonu kırmızı özeti böyle basılır); verilmezse metinden
+        sezilir. Ana pencerede artık log kutusu YOK — hedefler: `_log_gecmis`, log penceresi,
+        `log_ozet` tek satırlık önizleme ve gui_canli_log.txt.
+        """
+        if tag is None:
+            if s.lstrip().startswith("$"):
+                tag = "command"
+            elif "⚠" in s:
+                tag = "warning"
+            elif "!!" in s or "hata" in s.lower():
+                tag = "danger"
+            elif "✓" in s or "bitti" in s.lower():
+                tag = "success"
+        # Bellekteki geçmiş — log penceresi kapalıyken de birikir, açılınca oraya dökülür.
+        # Tavan: 8 saatlik koşuda bellek şişmesin (tam kayıt zaten gui_canli_log.txt'de).
+        self._log_gecmis.append((s, tag))
+        if len(self._log_gecmis) > LOG_TAVAN:
+            del self._log_gecmis[:len(self._log_gecmis) - LOG_TAVAN]
+        win_txt = getattr(self, "_log_win_txt", None)      # log penceresi açıksa canlı yaz
+        if win_txt is not None:
+            try:
+                if win_txt.winfo_exists():
+                    win_txt.insert("end", s, tag)
+                    win_txt.see("end")
+                else:
+                    self._log_win_txt = None
+            except Exception:  # noqa
+                self._log_win_txt = None
+        ozet = getattr(self, "log_ozet", None)             # ana penceredeki tek satırlık önizleme
+        if ozet is not None:
+            # Son ANLAMLI satır: ayraç/boşluk satırları atlanır, yoksa önizlemede "─────" görünür.
+            metin = next((x.strip() for x in reversed(s.splitlines())
+                          if any(c.isalnum() for c in x)), None)
+            if metin:
+                kisa = metin if len(metin) <= 74 else metin[:73].rstrip() + "…"
+                self._sessizce(lambda: ozet.configure(text=kisa,
+                                                      text_color=_LOG_RENK.get(tag, UI["muted"])))
         if self._log_dosyasi:
             try:
                 self._log_dosyasi.write(s)
@@ -952,10 +1282,12 @@ class IzinGUI:
         self._popup(f"{p.code} belge isimlendirme", txt)
 
     def _popup(self, title, text):
+        self._modal_oncesi()              # topmost log penceresi bu pencerenin önüne geçmesin
         win = ctk.CTkToplevel(self.root, fg_color=UI["bg"])
         win.title(title)
-        win.geometry("680x500")
-        win.minsize(560, 380)
+        geo, mw, mh = self._ust_pencere_plani(680, 500, 480, 340)   # bkz. _ust_pencere_plani
+        win.geometry(geo)
+        win.minsize(mw, mh)
         win.transient(self.root)
         head = ctk.CTkFrame(win, fg_color=UI["surface"], corner_radius=18)
         head.pack(fill="x", padx=16, pady=(16, 0))
@@ -1319,10 +1651,12 @@ class IzinGUI:
     def _istisna_popup(self, park, kisiler: "list[dict]"):
         secili = {_ist_key(k) for k in self.istisna}
 
+        self._modal_oncesi()          # topmost log penceresi modal'ın önüne geçmesin
         win = ctk.CTkToplevel(self.root, fg_color=UI["bg"])
         win.title(f"İstisna Kişiler — {park.code}")
-        win.geometry("780x700")
-        win.minsize(640, 500)
+        geo, mw, mh = self._ust_pencere_plani(780, 700, 560, 440)   # bkz. _ust_pencere_plani
+        win.geometry(geo)
+        win.minsize(mw, mh)
         win.transient(self.root)
 
         head = ctk.CTkFrame(win, fg_color=UI["surface"], corner_radius=18)
@@ -1544,6 +1878,7 @@ class IzinGUI:
         # Tekrar-dene teklifi YALNIZ gerçek DGS-giriş koşusundan sonra anlamlı (dry-run/onay/kontrol'de değil).
         if mod == "giris" and self.dgs_commit.get():
             self._retry_baglami = {
+                "modul": "dgs",
                 "park": p.code,
                 "excel": os.path.expanduser(self.dgs_excel.get().strip()),
                 "onayla": bool(self.dgs_onayla.get()),
@@ -1612,11 +1947,18 @@ class IzinGUI:
                                            "Yine de seçili parkla devam? (Motor yanlış portala işlem yapmaz, durur.)"):
                     return
 
-        self._retry_baglami = None      # İZİN modülü tekrar-dene akışına dahil değil (DGS'e özel)
+        # Tekrar-dene bağlamı: yalnız GERÇEK koşuda anlamlı (güvenli denemede yazan bir şey yok).
+        # Komut ŞİMDİ dondurulur — kullanıcı popup'a basana kadar Excel/belge alanını değiştirmiş
+        # olabilir; retry, biten koşunun ayarlarıyla koşmalı.
+        self._retry_baglami = None if plan else {"modul": "izin", "park": self._cur_park().code,
+                                                 "cmd": self._build_cmd(False)}
         self._spawn(self._build_cmd(plan), "Ön uçuş çalışıyor" if plan else "Otomasyon çalışıyor")
 
     def _spawn(self, cmd: list, calisiyor_mesaji: str):
         """Motoru ALT-SÜREÇ olarak koş — İZİN ve DGS ortak. Çıktısı canlı log'a akar."""
+        # Akış ana pencerede DEĞİL (bkz. _build_log) → koşu başlarken log penceresini kendiliğinden aç.
+        # odak=False: operatör o an Chrome'da login/Cloudflare ile uğraşıyor olabilir, klavyeyi çalma.
+        self._sessizce(lambda: self._log_penceresi_ac(odak=False))
         self._log("\n$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
         self._son_hatalar = []               # bu koşunun başarısızları taze toplanır (run bitince değerlendirilir)
         self._son_manuel = []                # kapanış sonu MANUEL giriş gereken kişiler [{"ad","sebep"}]
@@ -1667,6 +2009,26 @@ class IzinGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_done(self):
+        # ── İZİN TEKRAR-DENEME ZİNCİRİ: her kişi AYRI koşu (motorun --person'u tek ad alıyor) ──
+        # Biten kişinin sonucu yazılır, kuyrukta kişi varsa sıradaki başlar; bitince özet gösterilir.
+        if self._izin_retry_aktif:
+            ad = self._izin_retry_aktif
+            self._izin_retry_aktif = None
+            hata = next((h for h in self._son_hatalar
+                         if _fold_tr(h["ad"]) in _fold_tr(ad) or _fold_tr(ad) in _fold_tr(h["ad"])), None)
+            self._izin_retry_sonuc.append({"ad": ad, "ok": hata is None,
+                                           "mesaj": hata["mesaj"] if hata else ""})
+            self._log(("   ✓ " if hata is None else "   ✗ ") + f"{ad}\n")
+            if self._izin_retry_kuyruk:
+                self._izin_retry_ilerle()
+                return
+            for b in self._run_btns:
+                b.configure(state="normal")
+            for b in self._stop_btns:
+                b.configure(state="disabled")
+            self._izin_retry_ozet()
+            return
+
         # ── OTOMATİK KAPANIŞ: gerçek DGS-giriş bittiyse SGK raporuyla doğrula + eksikleri retry ──
         # Rapor-tabanlı kapanış, koşunun kendi bildirdiği hatalardan ÜSTÜN: sessizce Gün<30 kalanı
         # (ör. giriş "başarılı" dedi ama SGK'da eksik) da yakalar. _retry_baglami yalnız gerçek giriş-
@@ -1710,12 +2072,16 @@ class IzinGUI:
         # KAPANIŞ bittiyse: otomasyonun tamamlayamadığı (MANUEL giriş gereken) kişileri popup'ta göster.
         if bu_kapanis and self._son_manuel:
             self._retry_btn_gizle()
+            self._basarisiz_ozet_logla("MANUEL GİRİŞ GEREKEN KİŞİLER", list(self._son_manuel))
             self._manuel_popup(list(self._son_manuel))
             self._set_status(f"Kapanış bitti — {len(self._son_manuel)} kişi MANUEL giriş gerektiriyor", "warning")
-        # Kısmi giriş (--person/--limit) başarısız kişiyle bittiyse: eski tekrar-dene penceresi.
-        elif self._retry_baglami and self._son_hatalar:
+        # Koşu başarısız kişiyle bittiyse: "kaydedilemeyen kişiler" penceresi — HANGİ MODÜL OLURSA OLSUN.
+        # (Eskiden yalnız _retry_baglami dolu olan kısmi DGS koşusunda açılıyordu; İZİN koşusundan sonra
+        # hiç açılmıyordu. Bağlam yoksa pencere sebepleri gösterir, "Tekrar Dene" tuşu çıkmaz.)
+        elif self._son_hatalar:
             toplam = len(self._son_hatalar)
             denenebilir = sum(1 for h in self._son_hatalar if self._hata_yorumla(h["mesaj"])[1])
+            self._basarisiz_ozet_logla("KAYDEDİLEMEYEN KİŞİLER", list(self._son_hatalar))
             self._retry_btn_goster(toplam, denenebilir)
             self._set_status(f"{toplam} kişi kaydedilemedi — tekrar denenebilir", "warning")
             self._retry_popup(list(self._son_hatalar))
@@ -1725,6 +2091,7 @@ class IzinGUI:
 
     def _manuel_popup(self, kisiler: "list[dict]"):
         """Kapanış sonu: otomasyonun tamamlayamadığı kişileri 'manuel giriş gerekli' diye göster."""
+        self._modal_oncesi()              # messagebox topmost log penceresinin arkasında kalmasın
         satirlar = "\n".join(f"   •  {k.get('ad','?')}\n        → {k.get('sebep','')}" for k in kisiler)
         messagebox.showwarning(
             "Manuel giriş gerekli",
@@ -1735,19 +2102,75 @@ class IzinGUI:
 
     # ---------- başarısız kişiler: sınıflandır + tekrar dene ----------
     def _retry_btn_gizle(self):
-        btn = getattr(self, "retry_btn", None)
-        if btn is not None:
-            btn.pack_forget()
+        self._retry_durum = None
+        self._retry_btnleri_tazele()
 
     def _retry_btn_goster(self, toplam: int, denenebilir: int):
-        """Log altındaki kalıcı tuşu güncelle + göster. denenebilir=0 ise 'düzeltilmeli' rengi/metni."""
-        if denenebilir > 0:
-            self.retry_btn.configure(text=f"🔄  {toplam} kişi kaydedilemedi — {denenebilir} tekrar denenebilir",
-                                     fg_color=UI["warning"], text_color="#1A1206")
-        else:
-            self.retry_btn.configure(text=f"⚠  {toplam} kişi kaydedilemedi — düzeltilmeli (detayı gör)",
-                                     fg_color=UI["danger"], text_color="white")
-        self.retry_btn.pack(side="bottom", fill="x", pady=(8, 0), before=self.log)
+        """Kalıcı 'kaydedilemedi' tuşunu göster. denenebilir=0 ise 'düzeltilmeli' rengi/metni."""
+        self._retry_durum = {"toplam": toplam, "denenebilir": denenebilir}
+        self._retry_btnleri_tazele()
+
+    def _retry_btnleri_tazele(self):
+        """'Kaydedilemedi' tuşunu İKİ yerde birden kur: ana penceredeki log kartı + log penceresi.
+
+        Neden iki kopya: akış artık ayrı pencerede (bkz. _build_log). Operatör koşuyu orada izliyor;
+        tekrar denemek için ana pencereyi aramak zorunda kalmasın. Durum tek yerde (`_retry_durum`)
+        tutulur, iki tuş da ondan beslenir — log penceresi sonradan açılsa bile tuş doğru görünür.
+        """
+        d = getattr(self, "_retry_durum", None)
+        metin = renk = yazi = None
+        if d and d["denenebilir"] > 0:
+            metin = f"🔄  {d['toplam']} kişi kaydedilemedi — {d['denenebilir']} kişiyi TEKRAR DENE"
+            renk, yazi = UI["warning"], "#1A1206"
+        elif d:
+            metin = f"⚠  {d['toplam']} kişi kaydedilemedi — düzeltilmeli (detayı gör)"
+            renk, yazi = UI["danger"], "white"
+        hedefler = (
+            (getattr(self, "retry_btn", None), dict(fill="x", pady=(10, 0))),
+            (getattr(self, "_log_retry_btn", None), None),   # None → grid (log penceresi grid kullanıyor)
+        )
+        for btn, yerlesim in hedefler:
+            if btn is None:
+                continue
+            try:
+                if not btn.winfo_exists():
+                    continue
+                if d:
+                    btn.configure(text=metin, fg_color=renk, text_color=yazi)
+                    if yerlesim is None:
+                        btn.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 14))
+                    else:
+                        btn.pack(**yerlesim)
+                else:
+                    btn.grid_remove() if yerlesim is None else btn.pack_forget()
+            except Exception:  # noqa
+                pass
+
+    def _basarisiz_ozet_logla(self, baslik: str, kayitlar: "list[dict]"):
+        """Koşu bitiminde 'kim kaydedilemedi?' sorusunu LOG'un içinde, KIRMIZI ve toplu olarak yanıtla.
+
+        Neden: akış yüzlerce satır; tek tek '!! BAŞARISIZ' satırları yukarıda kaybolup gidiyor.
+        Operatörün run sonunda tek bakışta göreceği liste burada basılır — önce isimler yan yana,
+        sonra kişi başına sebep + 'tekrar denenebilir mi' işareti.
+        kayitlar: [{"ad","mesaj"}] (motorun ham sebebi, yorumlanır) | [{"ad","sebep"}] (hazır metin).
+        """
+        if not kayitlar:
+            return
+        cizgi = "─" * 60
+        satirlar = ["", cizgi,
+                    f"!!  {baslik} — {len(kayitlar)} KİŞİ",
+                    "!!  " + "  ·  ".join(k.get("ad", "?") for k in kayitlar),
+                    cizgi]
+        for i, k in enumerate(kayitlar, 1):
+            if "mesaj" in k:
+                aciklama, tekrar = self._hata_yorumla(k.get("mesaj", ""))
+            else:
+                aciklama, tekrar = (k.get("sebep", "") or "sebep bildirilmedi"), False
+            satirlar.append(f"!!  {i:>2}. {k.get('ad', '?')}")
+            satirlar.append(f"        {'🔄 tekrar denenebilir' if tekrar else '🔧 önce düzeltilmeli'}"
+                            f"  —  {aciklama}")
+        satirlar += [cizgi, ""]
+        self._log("\n".join(satirlar) + "\n", tag="danger")
 
     def _retry_ac(self):
         """Kalıcı tuş → 'Kaydedilemeyen kişiler' penceresini yeniden aç (son koşunun başarısızlarıyla)."""
@@ -1799,10 +2222,12 @@ class IzinGUI:
         denenebilir = [y["ad"] for y in yorumlu if y["tekrar"]]
         duzeltilecek = sum(1 for y in yorumlu if not y["tekrar"])
 
+        self._modal_oncesi()          # topmost log penceresi modal'ın önüne geçmesin
         win = ctk.CTkToplevel(self.root, fg_color=UI["bg"])
         win.title("Kaydedilemeyen kişiler")
-        win.geometry("660x540")
-        win.minsize(560, 420)
+        geo, mw, mh = self._ust_pencere_plani(660, 540, 500, 380)   # bkz. _ust_pencere_plani
+        win.geometry(geo)
+        win.minsize(mw, mh)
         win.transient(self.root)
         try:
             win.grab_set()
@@ -1840,18 +2265,90 @@ class IzinGUI:
         ctk.CTkButton(btnrow, text="Kapat", command=win.destroy, width=104, height=40, corner_radius=16,
                       fg_color=UI["card"], hover_color=UI["card_hover"], text_color=UI["text"],
                       font=("Helvetica", 10, "bold")).pack(side="right")
-        if denenebilir:
+        # "Tekrar Dene" YALNIZ bağlam varken çıkar (hangi park/Excel/ayarla koşulacağı bilinmeli).
+        # Bağlam modülü söyler: DGS tek koşuda --file listesiyle, İZİN kişi kişi zincirle dener.
+        b = self._retry_baglami
+        if denenebilir and b:
+            calistir = self._izin_retry if b.get("modul") == "izin" else self._dgs_retry
             ctk.CTkButton(btnrow, text=f"🔄  Tekrar Dene ({len(denenebilir)} kişi)",
-                          command=lambda: self._dgs_retry(denenebilir, win),
+                          command=lambda: calistir(denenebilir, win),
                           width=220, height=40, corner_radius=16,
                           fg_color=UI["primary"], hover_color=UI["primary_hover"], text_color="white",
                           font=("Helvetica", 11, "bold")).pack(side="right", padx=(0, 10))
 
-    def _dgs_retry(self, adlar: "list[str]", win):
-        """Başarısız kişileri geçici bir --file listesiyle yeniden koş (--file done-skip'i atlar → tam bu kişiler)."""
+    # ---------- İZİN: tekrar deneme (kişi kişi zincir) ----------
+    def _izin_retry(self, adlar: "list[str]", win=None):
+        """Seçilen kişileri TEK TEK yeniden koş.
+
+        Neden zincir: izin motorunun `--person` argümanı TEK ad/T.C. alıyor (liste dosyası yok).
+        Parkın tamamını yeniden koşmak ise başarısız olmayanları da riske atardı — bu yüzden yalnız
+        seçilen adlar, sırayla, kendi koşularında denenir. İzin motoru başarısız kişide "KAYDEDİLMEDİ"
+        diyerek çıkıyor (izin_poc.py:800/807) → tekrar denemek mükerrer yaratmaz.
+        """
+        self._modal_oncesi()              # onay kutusu topmost log penceresinin arkasında kalmasın
         b = self._retry_baglami
         if not b:
-            win.destroy()
+            self._sessizce(lambda: win and win.destroy())   # win=None → çağrı log penceresinden geldi
+            return
+        if self.proc is not None:
+            messagebox.showinfo("Çalışıyor", "Bir işlem zaten sürüyor. Önce bitmesini bekle veya Durdur.")
+            return
+        liste = "\n".join(f"• {a}" for a in adlar)
+        if not messagebox.askyesno(
+                "Tekrar deneme onayı",
+                f"{b['park']} parkında {len(adlar)} kişi TEKRAR denenecek (gerçek kayıt):\n\n{liste}\n\n"
+                "Kişiler sırayla, ayrı ayrı koşulur. Devam edilsin mi?"):
+            return
+        self._sessizce(lambda: win and win.destroy())
+        self._izin_retry_kuyruk = list(adlar)
+        self._izin_retry_sonuc = []
+        self._log(f"\n🔄 TEKRAR DENEME: {len(adlar)} kişi → {', '.join(adlar)}\n")
+        self._izin_retry_ilerle()
+
+    def _izin_retry_ilerle(self):
+        """Kuyruktaki sıradaki kişiyi koş (koşu bitince _run_done zinciri sürdürür)."""
+        ad = self._izin_retry_kuyruk.pop(0)
+        self._izin_retry_aktif = ad
+        kalan = len(self._izin_retry_kuyruk)
+        cmd = list(self._retry_baglami["cmd"]) + ["--person", ad]
+        self._spawn(cmd, f"Tekrar deneniyor: {ad}" + (f" (+{kalan} kişi sırada)" if kalan else ""))
+
+    def _izin_retry_ozet(self):
+        """Zincir bitti: kaç kişi kurtuldu, kim hâlâ kaydedilemedi → sonuç penceresi."""
+        sonuc = self._izin_retry_sonuc
+        self._izin_retry_sonuc = []
+        olan = [s for s in sonuc if s["ok"]]
+        kalan = [{"ad": s["ad"], "mesaj": s["mesaj"]} for s in sonuc if not s["ok"]]
+        self._log(f"\n🔄 Tekrar deneme bitti: {len(olan)} kurtarıldı, {len(kalan)} hâlâ kaydedilemedi.\n")
+        self._basarisiz_ozet_logla("HÂLÂ KAYDEDİLEMEYEN KİŞİLER", list(kalan))
+        self._on_dgs_park_change()                     # resume sayaçları tazelensin
+        if not kalan:
+            self._modal_oncesi()          # aşağıdaki showinfo topmost pencerenin arkasında kalmasın
+            self._retry_btn_gizle()
+            self._son_hatalar = []
+            self._set_status(f"Tekrar deneme tamam — {len(olan)} kişi kaydedildi", "success")
+            messagebox.showinfo("Tekrar deneme bitti",
+                                f"Denenen {len(sonuc)} kişinin hepsi kaydedildi ✓")
+            return
+        # Hâlâ kalanlar: aynı pencereyi yeniden sun (tekrar denenebilir olanlar için tuş yine çıkar)
+        self._son_hatalar = kalan
+        denenebilir = sum(1 for k in kalan if self._hata_yorumla(k["mesaj"])[1])
+        self._retry_btn_goster(len(kalan), denenebilir)
+        self._set_status(f"{len(olan)} kurtarıldı · {len(kalan)} kişi hâlâ kaydedilemedi", "warning")
+        self._retry_popup(list(kalan))
+
+    def _dgs_retry(self, adlar: "list[str]", win=None):
+        """Başarısız kişileri geçici bir --file listesiyle yeniden koş (--file done-skip'i atlar → tam bu kişiler).
+
+        win=None → çağrı log penceresindeki tuştan geldi (kapatılacak bir liste penceresi yok).
+        """
+        self._modal_oncesi()              # onay kutusu topmost log penceresinin arkasında kalmasın
+        b = self._retry_baglami
+        if not b:
+            self._sessizce(lambda: win and win.destroy())
+            return
+        if self.proc is not None:   # iki koşu aynı Chrome oturumunu paylaşır → mükerrer kayıt riski
+            messagebox.showinfo("Çalışıyor", "Bir işlem zaten sürüyor. Önce bitmesini bekle veya Durdur.")
             return
         liste = "\n".join(f"• {a}" for a in adlar)
         if not messagebox.askyesno(
@@ -1860,7 +2357,7 @@ class IzinGUI:
                 f"(gerçek kayıt{' + onaya gönderme' if b['onayla'] else ''} — GERİ ALINAMAZ):\n\n"
                 f"{liste}\n\nDevam edilsin mi?"):
             return
-        win.destroy()
+        self._sessizce(lambda: win and win.destroy())
         yol = os.path.join(DATA_DIR, f"dgs_retry_{b['park']}_{dgs_donem_ay()}.txt")
         try:
             with open(yol, "w", encoding="utf-8") as f:
@@ -1881,6 +2378,8 @@ class IzinGUI:
         self._spawn(cmd, "Başarısızlar tekrar deneniyor")   # _retry_baglami duruyor → zincirleme retry olur
 
     def _stop(self):
+        # Zinciri de kes: kuyruk boşaltılmazsa biten koşunun ardından SIRADAKİ kişi kendiliğinden başlar.
+        self._izin_retry_kuyruk = []
         if self.proc:
             try:
                 self.proc.terminate()
