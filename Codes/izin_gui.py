@@ -65,6 +65,16 @@ FONT_UI = "SF Pro Text" if sys.platform == "darwin" else "Segoe UI"
 FONT_DISPLAY = "SF Pro Display" if sys.platform == "darwin" else "Segoe UI"
 FONT_MONO = "SF Mono" if sys.platform == "darwin" else "Consolas"
 
+# Dosya diyaloğu uzantı filtreleri.
+# ⚠ Desen listesi TUPLE olarak verilir — tek string içinde boşlukla ayırmak ("*.xlsx *.xlsm")
+#   platformlar arasında güvenilir değil. Büyük harfli karşılıkları da yazılı: macOS/Linux'ta Tk
+#   eşleştirmeyi KENDİ yapar ve büyük/küçük harf duyarlıdır; "RAPOR.XLSX" aksi halde listelenmez.
+# ⚠ Her filtreye "Tüm dosyalar" eklenir: filtre beklenmedik bir şey yaparsa kullanıcı yine de
+#   dosyasını görebilsin — kilitlenip "hiçbir şey görünmüyor" durumuna düşmesin.
+EXCEL_TIPLERI = [("Excel dosyası", ("*.xlsx", "*.xlsm", "*.XLSX", "*.XLSM")),
+                 ("Tüm dosyalar", "*.*")]
+PDF_TIPLERI = [("PDF belgesi", ("*.pdf", "*.PDF")), ("Tüm dosyalar", "*.*")]
+
 # 🔴 SÜRÜM DAMGASI — exe'nin İÇİNE gömülür. Depodaki 'Etkin Otomasyon.exe' bir BUILD ÇIKTISIDIR:
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
 # Bir kez "yeni sürümü indirdim ama hiçbir şey değişmemiş" diye vakit kaybedildi (2026-09-04).
@@ -381,6 +391,10 @@ class IzinGUI:
         self._izin_retry_kuyruk: "list[str]" = []
         self._izin_retry_aktif = None             # şu an denenen ad (koşu bitince sonucu buna yazılır)
         self._izin_retry_sonuc: "list[dict]" = []  # [{"ad","ok","mesaj"}] → zincir sonunda özet
+
+        # Dosya diyaloglarının en son açıldığı klasör (anahtar → yol). Operatör her seferinde
+        # aynı yere gitmek zorunda kalmasın; ayrıca varsayılan klasör yoksa buradan kurtarırız.
+        self._son_klasor: "dict[str, str]" = {}
 
         # Log GEÇMİŞİ bellekte tutulur: akış artık ana pencerede DEĞİL, ayrı pencerede gösteriliyor
         # (neden: _build_log). Pencere kapalıyken de birikir, açılınca oraya dökülür. Tavanlı liste.
@@ -1196,25 +1210,56 @@ class IzinGUI:
         self._log(f"[LOGIN] {res.get('reason','')}\n")
 
     # ---------- seçiciler ----------
+    def _baslangic_klasoru(self, anahtar: str, *adaylar) -> str:
+        """Dosya diyaloğu NEREDEN açılsın: en son kullanılan klasör → adaylar → ev klasörü.
+
+        🔴 NEDEN VAR (Windows'ta "hiçbir dosya görünmüyor, klasörler boş" şikâyeti):
+        `initialdir` diskte OLMAYAN bir klasörü gösterirse Windows'un yerel diyaloğu boş açılıyor.
+        Eski kod yolları mac'e göre sabitlemişti (`~/Desktop`, `~/Desktop/İzin Belgeleri`); Windows'ta
+        Masaüstü çoğu zaman OneDrive altına taşındığı için `~/Desktop` HİÇ YOKTU.
+        Burada her aday `isdir` ile sınanır; hiçbiri yoksa ev klasörüne düşeriz — diyalog her koşulda
+        gerçek bir yerde açılır.
+        """
+        son = self._son_klasor.get(anahtar)
+        return izin_frozen._ilk_var_olan(son, *adaylar) or os.path.expanduser("~")
+
+    def _klasoru_hatirla(self, anahtar: str, secim: str, dosya_mi: bool):
+        """Seçim sonrası: bir dahaki sefere aynı yerden başla (dosya seçildiyse onun klasörü)."""
+        yol = os.path.dirname(secim) if dosya_mi else secim
+        if yol and os.path.isdir(yol):
+            self._son_klasor[anahtar] = yol
+
     def _pick_excel(self):
-        f = filedialog.askopenfilename(title="İzin Excel'i seç",
-                                       filetypes=[("Excel", "*.xlsx *.xlsm"), ("Tümü", "*.*")],
-                                       initialdir=os.path.expanduser("~/Downloads"))
+        f = filedialog.askopenfilename(
+            title="İzin Excel'i seç",
+            filetypes=EXCEL_TIPLERI,
+            initialdir=self._baslangic_klasoru("izin_excel", izin_frozen.indirilenler(),
+                                               izin_frozen.masaustu()))
         if f:
             self.excel_path.set(f)
+            self._klasoru_hatirla("izin_excel", f, dosya_mi=True)
             self._set_status("İzin Excel'i seçildi", "info")
 
     def _pick_belge(self):
         p = self._cur_park()
+        masa = izin_frozen.masaustu()
         if p.onay_pdf == "ortak":
-            f = filedialog.askopenfilename(title="Ortak izin belgesi (tek PDF)",
-                                           filetypes=[("PDF", "*.pdf")],
-                                           initialdir=os.path.expanduser("~/Desktop"))
+            # ORTAK mod: park için TEK toplu PDF → dosya seçici.
+            f = filedialog.askopenfilename(
+                title=f"{p.code} — ortak izin belgesi (tek PDF dosyası seç)",
+                filetypes=PDF_TIPLERI,
+                initialdir=self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
+                                                   izin_frozen.indirilenler()))
         else:
-            f = filedialog.askdirectory(title=f"{p.code} izin belgeleri klasörü",
-                                        initialdir=os.path.expanduser("~/Desktop/İzin Belgeleri"))
+            # PER_PERSON mod: kişi başına ayrı PDF → KLASÖR seçici.
+            # ⚠ Klasör seçici tasarımı gereği DOSYA LİSTELEMEZ; kullanıcı bunu "klasörler boş"
+            #   sanabiliyor. Başlıkta açıkça yazıyoruz ki PDF aramaya çalışmasın.
+            f = filedialog.askdirectory(
+                title=f"{p.code} — PDF'lerin BULUNDUĞU KLASÖRÜ seç (dosyalar listelenmez)",
+                initialdir=self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa))
         if f:
             self.belge_path.set(f)
+            self._klasoru_hatirla("belge", f, dosya_mi=(p.onay_pdf == "ortak"))
             self._set_status("Belge kaynağı seçildi", "info")
 
     # ---------- belge denetimi (portalsız) ----------
@@ -1315,7 +1360,7 @@ class IzinGUI:
                 "        (portal 'EZGİ ÇİFTÇİ', dosya 'Ezgi Ustaoğlu Çiftçi.pdf' → yine eşleşir).\n"
                 "   • YALNIZ PDF. Excel/Word gelirse önce PDF'e çevir.\n\n"
                 "Klasör kuralı (varsayılan):\n"
-                f"   ~/Desktop/İzin Belgeleri/{p.code} İzin Belgeleri/\n"
+                f"   {os.path.join(izin_frozen.masaustu(), 'İzin Belgeleri', p.code + ' İzin Belgeleri')}\n"
                 "   (farklı yerdeyse 'Klasör Seç…' ile göster.)"
             )
         else:
@@ -1790,11 +1835,14 @@ class IzinGUI:
 
     # ---------- DGS: seçici + öğretici popup'lar ----------
     def _pick_dgs_excel(self):
-        f = filedialog.askopenfilename(title="DGS Excel'i seç (teknokent puantaj dosyası)",
-                                       filetypes=[("Excel", "*.xlsx *.xlsm"), ("Tümü", "*.*")],
-                                       initialdir=os.path.expanduser("~/Downloads"))
+        f = filedialog.askopenfilename(
+            title="DGS Excel'i seç (teknokent puantaj dosyası)",
+            filetypes=EXCEL_TIPLERI,
+            initialdir=self._baslangic_klasoru("dgs_excel", izin_frozen.indirilenler(),
+                                               izin_frozen.masaustu()))
         if f:
             self.dgs_excel.set(f)
+            self._klasoru_hatirla("dgs_excel", f, dosya_mi=True)
             self._set_status("DGS Excel'i seçildi", "info")
 
     def _info_dgs_kod(self):

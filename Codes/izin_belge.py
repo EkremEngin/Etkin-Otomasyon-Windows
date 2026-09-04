@@ -34,11 +34,14 @@ import re
 import sys
 
 from izin_data_v2 import fold, PARKS, resolve_park, read_izin_v2
+import izin_frozen                                     # Masaüstü'nü platformdan bağımsız bulmak için
 
 _NUM_SUFFIX = re.compile(r"\s*\((\d+)\)\s*$")          # " (1)", " (2)" tekrar eki
 _TC_IN_NAME = re.compile(r"(?<!\d)(\d{11})(?!\d)")     # dosya adında 11 haneli T.C.
 _PDF_EXT = {".pdf"}
-DEFAULT_BASE = os.path.expanduser("~/Desktop/İzin Belgeleri")
+# 🔴 expanduser("~/Desktop") DEĞİL: Windows'ta Masaüstü OneDrive'a yönlendirilmiş olabilir ve o yol
+# hiç var olmaz → belge klasörü otomatik keşfi sessizce başarısız olurdu (bkz. izin_frozen.masaustu).
+DEFAULT_BASE = os.path.join(izin_frozen.masaustu(), "İzin Belgeleri")
 LOG = "[BELGE]"
 
 PER_PERSON = "per_person"   # kişi başına kendi belgesi

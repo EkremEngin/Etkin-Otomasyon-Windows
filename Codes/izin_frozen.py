@@ -38,6 +38,71 @@ def worker_cmd(mode: str) -> list:
     return [sys.executable, os.path.join(SCRIPT_DIR, _SCRIPTS[mode])]
 
 
+# ==========================================================================
+# Kullanıcı klasörleri — Masaüstü / İndirilenler
+# ==========================================================================
+# 🔴 WINDOWS TUZAĞI: os.path.expanduser("~/Desktop") mac'te hep doğrudur, WINDOWS'TA ÇOĞU ZAMAN YOKTUR.
+# OneDrive kuruluysa Masaüstü C:\Users\<ad>\OneDrive\Desktop'a taşınır. Var olmayan bir klasörü dosya
+# diyaloğuna `initialdir` olarak verirsen Windows'un yerel diyaloğu BOŞ açılır — kullanıcı "hiçbir
+# dosya görünmüyor, klasörler boş" der. (2026-09-04'te izin belgesi seçiminde tam olarak bu yaşandı.)
+#
+# Doğrusu Windows'a SORMAKTIR: kabuk klasörleri kayıt defterinde tutulur ve yönlendirme yapıldığında
+# oradaki değer de güncellenir. macOS/Linux'ta bu fonksiyonlar sessizce ~/Desktop'a düşer.
+
+_WIN_MASAUSTU = "Desktop"
+_WIN_INDIRILENLER = "{374DE290-123F-4565-9164-39C4925E467B}"   # İndirilenler'in bilinen-klasör GUID'i
+
+
+def _win_kabuk_klasoru(anahtar: str) -> "str | None":
+    """Windows kayıt defterinden gerçek kabuk klasörü yolu. Windows dışında / okunamazsa None."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import winreg
+    except Exception:  # noqa
+        return None
+    # "User Shell Folders" ham değeri tutar (%USERPROFILE%\... gibi), "Shell Folders" çözülmüşünü.
+    for alt in (r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, alt) as k:
+                yol = os.path.expandvars(winreg.QueryValueEx(k, anahtar)[0])
+                if os.path.isdir(yol):
+                    return yol
+        except OSError:
+            continue
+    return None
+
+
+def _ilk_var_olan(*adaylar) -> "str | None":
+    """Adaylardan diskte GERÇEKTEN var olan ilk klasör. Hiçbiri yoksa None."""
+    for a in adaylar:
+        if a and os.path.isdir(a):
+            return a
+    return None
+
+
+def masaustu() -> str:
+    """Kullanıcının Masaüstü klasörü. Bulunamazsa ev klasörü — asla var olmayan bir yol dönmez."""
+    od = (os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+          or os.environ.get("OneDriveCommercial"))
+    return _ilk_var_olan(
+        _win_kabuk_klasoru(_WIN_MASAUSTU),
+        os.path.join(od, "Desktop") if od else None,
+        os.path.expanduser("~/Desktop"),
+        os.path.expanduser("~/Masaüstü"),
+    ) or os.path.expanduser("~")
+
+
+def indirilenler() -> str:
+    """Kullanıcının İndirilenler klasörü. Bulunamazsa ev klasörü."""
+    return _ilk_var_olan(
+        _win_kabuk_klasoru(_WIN_INDIRILENLER),
+        os.path.expanduser("~/Downloads"),
+        os.path.expanduser("~/İndirilenler"),
+    ) or os.path.expanduser("~")
+
+
 def data_dir() -> str:
     """Resume/done dosyalarının (dgs_done_*.txt · izin_done_*.txt) yazıldığı KALICI klasör.
 
@@ -56,7 +121,7 @@ def data_dir() -> str:
     if not is_frozen():
         return SCRIPT_DIR                                   # geliştirme: proje klasörü (mevcut davranış)
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-    # macOS .app: .../IzinOtomasyonu.app/Contents/MacOS/IzinOtomasyonu → paketin DIŞINA çık
+    # macOS .app: .../Etkin Otomasyon.app/Contents/MacOS/Etkin Otomasyon → paketin DIŞINA çık
     suffix = os.sep + os.path.join("Contents", "MacOS")
     if exe_dir.endswith(suffix):
         exe_dir = os.path.dirname(exe_dir[: -len(suffix)])  # .app'i içeren klasör
