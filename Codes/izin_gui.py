@@ -113,7 +113,7 @@ PDF_TIPLERI = [("PDF belgesi (.pdf)", _uzanti_desenleri((".pdf",))), ("Tüm dosy
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
 # Bir kez "yeni sürümü indirdim ama hiçbir şey değişmemiş" diye vakit kaybedildi (2026-09-04).
 # Bu damga arayüzün üst şeridinde ve log'un ilk satırında görünür → hangi build olduğu belli olur.
-SURUM = "2026-09-04"
+SURUM = "2026-09-21"
 
 def _domain(url: str) -> str:
     return urllib.parse.urlsplit(url or "").netloc.lower()
@@ -1716,7 +1716,7 @@ class IzinGUI:
                       text_color=UI["cyan"], anchor="w",
                       font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(9, 0))
         ctk.CTkLabel(b3, text="⚠ Bu, izin Excel'i DEĞİL: teknokent puantaj dosyası (ör. “06-TEKNOKENTLER — "
-                              "HAZİRAN 2026 - FİNAL_9SAAT.xlsx”). Sayfa adı dönemin ay adıdır.",
+                              "HAZİRAN 2026 - FİNAL_9SAAT.xlsx”). Puantaj sayfası otomatik bulunur.",
                      text_color=UI["warning"], wraplength=560, justify="left", anchor="w",
                      font=("Helvetica", 9)).pack(fill="x", pady=(6, 0))
 
@@ -2146,7 +2146,8 @@ class IzinGUI:
             "   H → Ar-Ge / Destek        ← Destek'çiler VARSAYILAN OLARAK İŞLENMEZ (4. adımdaki kutu)\n"
             "   N → Eksik puantaj (saat)\n"
             "   W → Proje adı\n\n"
-            "SAYFA (sheet): dönemin ay adı — ör. “Haziran”. Otomatik seçilir.\n"
+            "SAYFA (sheet): ay adı önceliklidir; farklı ad varsa puantaj başlıklarından bulunur.\n"
+            "Sayfa1 gibi değer olarak kopyalanmış tek puantaj sayfası da desteklenir.\n"
             "DÖNEM: bugünden bir ÖNCEKİ ay. Otomatik türetilir.\n\n"
             "⚠ Bu dosya İZİN Excel'i DEĞİLDİR. İzin Excel'i ayrı bir dosyadır (T.C./Ad-Soyad/Tarih/Gün/TGB).\n"
             "   Karıştırırsan motor kişileri bulamaz ve hiçbir şey yazmadan durur."
@@ -2322,6 +2323,10 @@ class IzinGUI:
         self._log("\n$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
         self._son_hatalar = []               # bu koşunun başarısızları taze toplanır (run bitince değerlendirilir)
         self._son_manuel = []                # kapanış sonu MANUEL giriş gereken kişiler [{"ad","sebep"}]
+        self._son_cikis_kodu = None
+        self._son_genel_hata = ""
+        dgs_cmd = izin_frozen.worker_cmd("dgs")
+        self._son_dgs_islemi = cmd[:len(dgs_cmd)] == dgs_cmd
         self._retry_btn_gizle()              # önceki koşunun tekrar-dene tuşu varsa kaldır
         for b in self._run_btns:
             b.configure(state="disabled")
@@ -2349,6 +2354,8 @@ class IzinGUI:
                     if "DeprecationWarning" in line or "trace-deprecation" in line or "url.parse()" in line:
                         continue
                     self.out_q.put(line)
+                    if "EXCEL HATASI:" in line:
+                        self._son_genel_hata = line.split("EXCEL HATASI:", 1)[1].strip()
                     m = _BASARISIZ_RE.search(line)   # "!! BAŞARISIZ: <ad> — <sebep>" → tekrar-dene için topla
                     if m:
                         self._son_hatalar.append({"ad": m.group(1).strip(), "mesaj": m.group(2).strip()})
@@ -2359,8 +2366,11 @@ class IzinGUI:
                         except Exception:  # noqa
                             pass
                 self.proc.wait()
+                self._son_cikis_kodu = self.proc.returncode
                 self.out_q.put(f"\n=== İşlem bitti (çıkış kodu {self.proc.returncode}) ===\n")
             except Exception as e:  # noqa
+                self._son_cikis_kodu = -1
+                self._son_genel_hata = "İşlem başlatılamadı veya çıktısı okunamadı. Canlı log'u kontrol edin."
                 self.out_q.put(f"\n!! Çalıştırma hatası: {e}\n")
             finally:
                 self.proc = None
@@ -2369,6 +2379,22 @@ class IzinGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_done(self):
+        # Excel/başlangıç hatası veya durdurulmuş süreç sonrası gerçek kayıt yapan kapanışı başlatma.
+        if self._son_dgs_islemi and self._son_cikis_kodu != 0:
+            self._retry_baglami = None
+            self._kapanis_asamasi = False
+            for b in self._run_btns:
+                b.configure(state="normal")
+            for b in self._stop_btns:
+                b.configure(state="disabled")
+            self._retry_btn_gizle()
+            self._set_status("DGS işlemi tamamlanamadı — canlı log'u kontrol edin", "danger")
+            self._modal_oncesi()
+            messagebox.showwarning(
+                "DGS işlemi durdu",
+                (self._son_genel_hata or "İşlem hata verdi veya durduruldu. Ayrıntı için canlı log'u kontrol edin.")
+                + "\n\nOtomatik tekrar giriş başlatılmadı.")
+            return
         # ── İZİN TEKRAR-DENEME ZİNCİRİ: her kişi AYRI koşu (motorun --person'u tek ad alıyor) ──
         # Biten kişinin sonucu yazılır, kuyrukta kişi varsa sıradaki başlar; bitince özet gösterilir.
         if self._izin_retry_aktif:

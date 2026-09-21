@@ -318,13 +318,18 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
 
     # rapor-adı (ASCII-fold) → bu PARKIN Excel'indeki TAM ad (yalnız bu park; çapraz-park çakışması olmasın)
     fold_map = {}
-    if xl:
-        try:
-            allp = D.read_excel(os.path.expanduser(xl), sheet)
-            fold_map = {D._fold_tr(k): k for k in allp
-                        if allp[k].lokasyon.upper() == park.code.upper()}
-        except Exception as e:                                          # noqa
-            print(f"[KAPANIŞ] UYARI: Excel okunamadı ({e}) → rapor-adı eşlemesi yapılamayacak.", flush=True)
+    if not xl:
+        print("[KAPANIŞ] EXCEL HATASI: DGS puantaj dosyası seçilmedi. Tekrar giriş başlatılmadı.", flush=True)
+        sys.exit(2)
+    try:
+        allp = D.read_excel(os.path.expanduser(xl), sheet)
+        fold_map = {D._fold_tr(k): k for k in allp
+                    if allp[k].lokasyon.upper() == park.code.upper()}
+        if not fold_map:
+            raise ValueError(f"Excel'de {park.code} lokasyonunda personel bulunamadı.")
+    except Exception as e:                                          # noqa
+        print(f"[KAPANIŞ] EXCEL HATASI: {e} Tekrar giriş başlatılmadı.", flush=True)
+        sys.exit(2)
 
     # İSTİSNA kişiler (varsa): otomasyon onlara DOKUNMASIN → fix hedefinden çıkarılır (giriş bilinçli atlamıştı)
     istisna_fold = set()
@@ -367,17 +372,17 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
 
     MAX_TUR = 3
     vazgec, ad_map, son_eksik = dict(skip_giris), {}, []   # vazgec: fold→{ad,sebep} (kalıcı; ana-giriş skip'i dahil)
-    for tur in range(1, MAX_TUR + 1):
-        print(f"\n[KAPANIŞ] ===== Tur {tur}/{MAX_TUR}: SGK raporu kontrol ediliyor =====", flush=True)
+    for tur in range(1, MAX_TUR + 2):
+        print(f"\n[KAPANIŞ] ===== Kontrol {tur}/{MAX_TUR + 1}: SGK raporu kontrol ediliyor =====", flush=True)
         r = subprocess.run(base + ["kontrol"] + ortak, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
         sys.stdout.write(r.stdout)
-        if r.returncode != 0 and r.stderr:
+        if r.stderr:
             sys.stdout.write(r.stderr)
         m = _re.search(r"<<<EKSIK>>>(.*)", r.stdout)
-        if not m:
+        if r.returncode != 0 or not m:
             print("[KAPANIŞ] ⚠️ Rapor üretilemedi / <<<EKSIK>>> okunamadı → döngü durdu.", flush=True)
-            break
+            sys.exit(2)
         eksik = [nm for nm in _json.loads(m.group(1)).get("kisiler", []) if D._fold_tr(nm) not in istisna_fold]
         for nm in eksik:
             ad_map.setdefault(D._fold_tr(nm), fold_map.get(D._fold_tr(nm), nm))
@@ -388,6 +393,8 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
         denenecek = [nm for nm in eksik if D._fold_tr(nm) not in vazgec]   # kalıcı-hatalıları tekrar deneme
         if not denenecek:
             print(f"\n[KAPANIŞ] Kalan {len(eksik)} kişi KALICI hata → tekrar denenmeyecek (MANUEL gerekli).", flush=True)
+            break
+        if tur > MAX_TUR:   # üçüncü girişin sonucunu da rapordan doğrula; dördüncü kez giriş yapma
             break
         hedefler, eslesmeyen = [], []
         for nm in denenecek:
@@ -409,6 +416,12 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
                             capture_output=True, text=True, encoding="utf-8", errors="replace",
                             stdin=subprocess.DEVNULL)
         sys.stdout.write(gr.stdout)
+        if gr.stderr:
+            sys.stdout.write(gr.stderr)
+        if gr.returncode != 0:
+            print(f"[KAPANIŞ] Giriş çalıştırılamadı (çıkış kodu {gr.returncode}). "
+                  "Yukarıdaki hatayı düzeltin; otomatik tekrar durduruldu.", flush=True)
+            sys.exit(gr.returncode)
         for mm in _BAS_RE.finditer(gr.stdout):      # kalıcı-hata verenleri işaretle → bir daha deneme
             ad, reason = mm.group(1).strip(), mm.group(2).strip()
             if _kalici(reason):
@@ -422,7 +435,7 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
     for nm in son_eksik:
         f = D._fold_tr(nm)
         kisiler.append(vazgec.get(f, {"ad": ad_map.get(f, nm),
-                                       "sebep": "3 turda düzelmedi (portal geçici hatası tekrarladı)"}))
+                                       "sebep": "3 giriş denemesinden sonra SGK raporu hâlâ eksik; canlı log'u kontrol edin"}))
     print(f"<<<MANUEL>>>{_json.dumps({'lokasyon': park.code, 'kisiler': kisiler}, ensure_ascii=False)}", flush=True)
     print()
     if kisiler:

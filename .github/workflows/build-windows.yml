@@ -67,6 +67,41 @@ jobs:
           "çıkış kodu: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "exe 'paths' ile $($p.ExitCode) koduyla düştü — bundle bozuk." }
 
+      - name: DGS Excel uyumluluğu — derlenmiş exe
+        working-directory: Codes
+        shell: python
+        run: |
+          import json, pathlib, subprocess, tempfile
+          from openpyxl import Workbook
+          exe = pathlib.Path('dist/Etkin Otomasyon.exe').resolve()
+          headers = ['AD SOYAD', 'TC Kimlik', 'BÖLÜM', 'Lokasyonu\nSGK',
+                     'Ar-Ge/ Destek/ K.Dışı', 'Eksik Puantaj (Saat)', 'Proje Adı']
+          # Tamamen yapay veri; çalışan dosyaları CI'a yüklenmez. liste modu portala bağlanmaz.
+          with tempfile.TemporaryDirectory() as temp:
+              for title in ['AĞUTOS', 'Sayfa1']:
+                  wb = Workbook()
+                  wb.active.title = title
+                  wb.active.append(headers)
+                  for park in ['TPIz', 'Ulutek']:
+                      wb.active.append(['ÖRNEK ' + park, '12345678901', 'Bölüm', park,
+                                        'Ar-Ge', 0, 'Örnek proje'])
+                  wb.create_sheet('Özet').append(['Çalışan sayısı'])
+                  path = pathlib.Path(temp) / (title + '.xlsx')
+                  wb.save(path)
+                  wb.close()
+                  for park in ['TPIz', 'Ulutek']:
+                      result = subprocess.run(
+                          [str(exe), 'dgs', '--park', park, 'liste', '--excel', str(path),
+                           '--donem', 'AĞUSTOS 2026'], cwd=temp, capture_output=True,
+                          text=True, encoding='utf-8', errors='replace', timeout=60)
+                      if result.returncode:
+                          raise RuntimeError(result.stdout + result.stderr)
+                      data = json.loads(result.stdout.split('<<<LISTE>>>', 1)[1])
+                      assert data['sheet'] == 'Ağustos', data
+                      assert len(data['kisiler']) == 1, data
+                      assert data['kisiler'][0]['ad'] == 'ÖRNEK ' + park, data
+                      print(f'PASS: {title} / {park}, dönem ve personel eşleşti')
+
       - uses: actions/upload-artifact@v4
         with:
           name: Etkin-Otomasyon-exe

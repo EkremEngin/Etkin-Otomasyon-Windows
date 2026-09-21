@@ -198,28 +198,71 @@ class PersonRow:
     tc: str = ""
 
 
+def _puantaj_sheet(wb, sheet: str):
+    """Ay adı farklı olsa da yalnız başlıkları doğrulanmış tek puantaj sayfasını seç."""
+    def key(value):
+        return "".join(c for c in _fold_tr(str(value or "")) if c.isalnum())
+
+    headers = {
+        "ad_soyad": "AD SOYAD", "tc": "TC Kimlik", "bolum": "BÖLÜM",
+        "lokasyon": "Lokasyonu SGK", "ar_ge": "Ar-Ge/ Destek/ K.Dışı",
+        "eksik_puantaj": "Eksik Puantaj (Saat)", "proje_adi": "Proje Adı",
+    }
+
+    def columns(ws):
+        row = [key(v) for v in next(ws.iter_rows(max_row=1, values_only=True), ())]
+        if not all(row.count(key(h)) == 1 for h in headers.values()):
+            return None
+        return {field: row.index(key(h)) for field, h in headers.items()}
+
+    preferred = [ws for ws in wb if _fold_tr(ws.title) == _fold_tr(sheet)]
+    if sheet in wb.sheetnames:
+        preferred = [wb[sheet]]
+    if len(preferred) == 1:
+        cols = columns(preferred[0])
+        if cols is None:
+            raise ValueError(f"'{preferred[0].title}' sayfasında DGS puantaj başlıkları eksik veya yinelenmiş. "
+                             "AD SOYAD, TC Kimlik, BÖLÜM, Lokasyonu SGK, Ar-Ge/ Destek/ K.Dışı, "
+                             "Eksik Puantaj (Saat) ve Proje Adı başlıklarını kontrol edin.")
+        return preferred[0], cols
+
+    candidates = [(ws, cols) for ws in wb if (cols := columns(ws)) is not None]
+    if len(candidates) != 1:
+        if candidates:
+            names = ", ".join(ws.title for ws, _ in candidates)
+            raise ValueError(f"Birden fazla DGS puantaj sayfası var ({names}); "
+                             f"ilgili sayfanın adını '{sheet}' yapın veya --sheet ile seçin.")
+        raise ValueError("DGS puantaj sayfası bulunamadı. İzin veya özet dosyası yerine "
+                         "AD SOYAD, TC Kimlik, Lokasyonu SGK ve Proje Adı başlıklarını içeren dosyayı seçin.")
+
+    ws, cols = candidates[0]
+    # Başka bir ayın açıkça adlandırılmış puantajını seçilen döneme sessizce uygulama.
+    import re
+    months = {_fold_tr(m) for m in TR_AYLAR_TITLE.values()}
+    named_months = set(re.findall(r"[a-z]+", _fold_tr(ws.title))) & months
+    if _fold_tr(sheet) in months and named_months and named_months != {_fold_tr(sheet)}:
+        raise ValueError(f"Beklenen dönem sayfası '{sheet}', bulunan puantaj '{ws.title}'. "
+                         "Doğru dönemin dosyasını seçin.")
+    log(f"Puantaj sayfası başlıklardan bulundu: '{ws.title}' (beklenen ad: '{sheet}').")
+    return ws, cols
+
+
 def read_excel(path: str, sheet: str = "Mayıs") -> dict[str, PersonRow]:
-    """A=AD SOYAD, B=TC Kimlik, E=BÖLÜM, F=Lokasyonu SGK, H=Ar-Ge/Destek, N=Eksik Puantaj, W=Proje Adı.
-    TC (2026-07-14 eklendi): select_personel'de T.C.-öncelikli kimlik doğrulaması için (izin_poc'taki
-    CANLI kanıtlanmış fix'in DGS karşılığı — isim evlilik/kızlık soyadı farkına dayanıklı seçim)."""
+    """Puantajı doğrulanmış başlıklardan oku; dosyayı ve dönem/resume anahtarını değiştirme."""
     wb = load_workbook(path, data_only=True, read_only=True)
-    ws = wb[sheet]
     out: dict[str, PersonRow] = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        ad = (row[0] or "").strip() if row[0] else ""
-        if not ad:
-            continue
-        tc_val = row[1] if len(row) > 1 and row[1] is not None else ""
-        out[ad.upper()] = PersonRow(
-            ad_soyad=ad,
-            bolum=(str(row[4]).strip() if len(row) > 4 and row[4] else ""),
-            lokasyon=(str(row[5]).strip() if len(row) > 5 and row[5] else ""),
-            ar_ge=(str(row[7]).strip() if len(row) > 7 and row[7] else ""),
-            eksik_puantaj=(str(row[13]).strip() if len(row) > 13 and row[13] is not None else ""),
-            proje_adi=(str(row[22]).strip() if len(row) > 22 and row[22] else ""),
-            tc=(str(tc_val).strip() if tc_val != "" else ""),
-        )
-    log(f"Excel okundu: {len(out)} personel ({sheet})")
+    try:
+        ws, cols = _puantaj_sheet(wb, sheet)
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            values = {field: str(row[i]).strip() if i < len(row) and row[i] is not None else ""
+                      for field, i in cols.items()}
+            if values["ad_soyad"]:
+                out[values["ad_soyad"].upper()] = PersonRow(**values)
+        if not out:
+            raise ValueError(f"'{ws.title}' puantaj sayfasında personel bulunamadı.")
+        log(f"Excel okundu: {len(out)} personel ({ws.title})")
+    finally:
+        wb.close()
     return out
 
 
@@ -1420,7 +1463,11 @@ def main():
     sheet = args.sheet or TR_AYLAR_TITLE[ay_no]
     log(f"Dönem: {donem_label} (ay_regex={ay_regex}, sheet='{sheet}')")
 
-    allp = read_excel(args.excel, sheet)
+    try:
+        allp = read_excel(args.excel, sheet)
+    except Exception as e:
+        log(f"EXCEL HATASI: {e}")
+        sys.exit(2)
     if args.person:
         key = args.person.upper()
         if key not in allp:
