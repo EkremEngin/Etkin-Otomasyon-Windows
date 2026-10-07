@@ -51,7 +51,8 @@ class _NodePage:
         result = subprocess.run(["node", "-e", script, expression,
                                  json.dumps(self.rows, ensure_ascii=False),
                                  json.dumps(arg, ensure_ascii=False)],
-                                capture_output=True, text=True, check=True, timeout=10)
+                                capture_output=True, text=True, encoding="utf-8",
+                                check=True, timeout=10)
         payload = json.loads(result.stdout)
         self.clicked = payload["clicked"]
         return payload["result"]
