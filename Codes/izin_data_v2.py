@@ -242,10 +242,13 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True,
     """
     path = os.path.expanduser(path)
     wb = load_workbook(path, data_only=True, read_only=True)
-    sh = sheet or _pick_sheet(wb)
-    ws = wb[sh]
-    rows = list(ws.iter_rows(values_only=True))
-    hdr_i, ci = _find_header(rows)
+    try:
+        sh = sheet or _pick_sheet(wb)
+        ws = wb[sh]
+        rows = list(ws.iter_rows(values_only=True))
+        hdr_i, ci = _find_header(rows)
+    finally:
+        wb.close()
     if not ci["park_explicit"]:
         park = resolve_park(default_park)
         if park is None:
