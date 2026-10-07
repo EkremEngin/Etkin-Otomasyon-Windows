@@ -50,6 +50,8 @@ jobs:
 
       - name: Dijitalpark veri ve kişi mutabakatı testleri
         working-directory: Codes
+        env:
+          PYTHONIOENCODING: utf-8
         run: python -m unittest -q test_dijitalpark
 
       - name: Derle
