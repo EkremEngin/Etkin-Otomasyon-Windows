@@ -68,11 +68,21 @@ _KABUL = {
     "onay": {"--excel", "--sheet", "--donem", "--lokasyon", "--limit", "--commit", "--dry-run"},
     "kontrol": {"--lokasyon", "--sheet", "--donem", "--write-fix", "--threshold"},
     "liste": set(),                      # motora gitmez; dgs_park kendi işler
-    "kapanis": {"--excel", "--sheet", "--donem"},   # orkestrasyon; alt-çağrılara (kontrol/giris) geçer
+    "kapanis": {"--excel", "--sheet", "--donem", "--commit", "--onayla", "--include-destek"},
 }
 _DEGERLI = {"--excel", "--sheet", "--donem", "--lokasyon", "--person", "--file", "--limit",
             "--dump-names", "--threshold"}
 _ORTAK = {"--help"}     # her argparse'ın kabul ettiği; süzgeçte yenmesin (yoksa `--help` yerine "--excel şart" hatası gelir)
+
+
+def kapanis_komutu(base: list[str], park: str, excel: str, *, onayla: bool, destek: bool) -> list[str]:
+    """Ana girişteki kapsamı ve onay tercihini kapanış tekrarlarına taşır."""
+    cmd = base + ["--park", park, "kapanis", "--excel", excel, "--commit"]
+    if onayla:
+        cmd.append("--onayla")
+    if destek:
+        cmd.append("--include-destek")
+    return cmd
 
 
 def _filtrele(argv: list[str], mod: str) -> list[str]:
@@ -281,9 +291,16 @@ def _liste(D, park: Park, excel: str | None, sheet: str):
     if not excel:
         _hata("liste modu --excel ister.")
     allp = D.read_excel(excel, sheet, park.code)
-    done_file = f"dgs_done_{park.code}_{sheet}.txt"          # cwd'ye göre (GUI cwd=data_dir verir)
+    company_suffix = ""
+    if park.code == "Dijitalpark":
+        expected = os.environ.get("DGS_EXPECTED_COMPANY", "").strip()
+        if expected:
+            import portal_tenant
+            company_suffix = "_" + portal_tenant.resume_suffix(expected)
+    done_file = (f"dgs_done_{park.code}_{sheet}{company_suffix}.txt" if company_suffix
+                 or park.code != "Dijitalpark" else None)  # cwd'ye göre (GUI cwd=data_dir verir)
     done = set()
-    if os.path.exists(done_file):
+    if done_file and os.path.exists(done_file):
         with open(done_file, encoding="utf-8") as f:
             done = {s.strip() for s in f if s.strip()}
     kisiler = sorted(
@@ -300,7 +317,7 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
     """KAPANIŞ DÖNGÜSÜ (2026-07-15) — giriş sonrası kapanış kontrolü + otomatik tekrar-koşu.
 
     Akış: SGK raporunu 'kontrol' ile çek → ÇALIŞAN + Gün<30 (kontrol <<<EKSIK>>>'i; ayrılanlar
-    zaten hariç) → o kişileri --file ile TEKRAR koş (giriş+onay) → tekrar kontrol, temiz olana dek
+    zaten hariç) → o kişileri --file ile TEKRAR koş (onay tercihini koru) → tekrar kontrol, temiz olana dek
     (max 3 tur). 3 turda düzelmeyen ısrarcıları (grid/yanlış-pencere sorunlusu) 'ELLE BAK' raporlar.
 
     ⚠ GERÇEK giriş+onay (geri alınamaz). Rapor-adı ('REMZI TIRE', ASCII) → Excel tam-adı ('REMZİ TİRE')
@@ -308,6 +325,11 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
     import subprocess
     import json as _json
     import re as _re
+    if "--commit" not in argv:
+        print("[KAPANIŞ] --commit olmadan gerçek tekrar giriş başlatılamaz.", flush=True)
+        sys.exit(2)
+    onayla = "--onayla" in argv
+    destek = "--include-destek" in argv
     try:
         import izin_frozen
         base = izin_frozen.worker_cmd("dgs") + ["--park", park.code]
@@ -319,13 +341,17 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
 
     # rapor-adı (ASCII-fold) → bu PARKIN Excel'indeki TAM ad (yalnız bu park; çapraz-park çakışması olmasın)
     fold_map = {}
+    all_location_fold = set()
     if not xl:
         print("[KAPANIŞ] EXCEL HATASI: DGS puantaj dosyası seçilmedi. Tekrar giriş başlatılmadı.", flush=True)
         sys.exit(2)
     try:
         allp = D.read_excel(os.path.expanduser(xl), sheet, park.code)
+        all_location_fold = {D._fold_tr(k) for k in allp
+                             if allp[k].lokasyon.upper() == park.code.upper()}
         fold_map = {D._fold_tr(k): k for k in allp
-                    if allp[k].lokasyon.upper() == park.code.upper()}
+                    if allp[k].lokasyon.upper() == park.code.upper()
+                    and (destek or D.is_ar_ge(allp[k]))}
         if not fold_map:
             raise ValueError(f"Excel'de {park.code} lokasyonunda personel bulunamadı.")
     except Exception as e:                                          # noqa
@@ -384,12 +410,14 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
         if r.returncode != 0 or not m:
             print("[KAPANIŞ] ⚠️ Rapor üretilemedi / <<<EKSIK>>> okunamadı → döngü durdu.", flush=True)
             sys.exit(2)
-        eksik = [nm for nm in _json.loads(m.group(1)).get("kisiler", []) if D._fold_tr(nm) not in istisna_fold]
+        eksik = [nm for nm in _json.loads(m.group(1)).get("kisiler", [])
+                 if D._fold_tr(nm) not in istisna_fold
+                 and (D._fold_tr(nm) in fold_map or D._fold_tr(nm) not in all_location_fold)]
         for nm in eksik:
             ad_map.setdefault(D._fold_tr(nm), fold_map.get(D._fold_tr(nm), nm))
         son_eksik = eksik
         if not eksik:
-            print(f"\n[KAPANIŞ] ✅ TEMİZ — çalışan herkes Gün=30. Kapanış tamam (tur {tur}).", flush=True)
+            print(f"\n[KAPANIŞ] ✅ TEMİZ — seçili kapsamdaki çalışanlar Gün=30. Kapanış tamam (tur {tur}).", flush=True)
             break
         denenecek = [nm for nm in eksik if D._fold_tr(nm) not in vazgec]   # kalıcı-hatalıları tekrar deneme
         if not denenecek:
@@ -411,8 +439,11 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
         retry_file = f"dgs_kapanis_retry_{park.code}_{sheet}.txt"
         with open(retry_file, "w", encoding="utf-8") as f:
             f.write("\n".join(hedefler) + "\n")
-        print(f"[KAPANIŞ] --file {retry_file} → giriş+onay koşuluyor…\n", flush=True)
-        gr = subprocess.run(base + ["giris", "--file", retry_file, "--commit", "--onayla", "--include-destek"]
+        print(f"[KAPANIŞ] --file {retry_file} → giriş"
+              f"{' + onay' if onayla else ' (yalnız taslak)'} koşuluyor…\n", flush=True)
+        gr = subprocess.run(base + ["giris", "--file", retry_file, "--commit"]
+                            + (["--onayla"] if onayla else [])
+                            + (["--include-destek"] if destek else [])
                             + (["--excel", xl] if xl else []) + ortak,
                             capture_output=True, text=True, encoding="utf-8", errors="replace",
                             stdin=subprocess.DEVNULL)

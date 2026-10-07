@@ -1,14 +1,21 @@
 """Dijitalpark taslakları ve sessiz kişi kaybı için portalsız regresyon kontrolleri."""
 import datetime
+import json
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
 import dgs_poc
 import izin_data_v2
 import izin_otomasyon
+import izin_poc
+import portal_tenant
 
 
 class DijitalparkWorkbookTests(unittest.TestCase):
@@ -117,6 +124,77 @@ class DijitalparkWorkbookTests(unittest.TestCase):
         incomplete = izin_otomasyon.reconcile(by_park["DIJITALPARK"], results[:1],
                                                izin_data_v2.PARKS["DIJITALPARK"])
         self.assertEqual(len(incomplete["kayip"]), 1)
+
+    def test_izin_resume_same_name_different_tc_is_not_skipped(self):
+        class FakeEngine:
+            class CloudflareHalt(Exception):
+                pass
+
+            class VerifyError(Exception):
+                pass
+
+            def __init__(self):
+                self.seen = []
+
+            def assert_logged_in(self, _page):
+                pass
+
+            def process_one_person(self, _page, person, _first):
+                self.seen.append(person.tc)
+                return {"ad": person.ad, "ok": True, "kaydedildi": False,
+                        "girilen": ["01.09.2026"], "flag": [], "mesaj": "DRY-RUN"}
+
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+        os.chdir(self.temp.name)
+        company = "ÖRNEK PROJE ANONİM ŞİRKETİ"
+        path = Path(f"izin_done_Dijitalpark_Eylul_{portal_tenant.resume_suffix(company)}.txt")
+        path.write_text("31**\tÖRNEK KİŞİ\n", encoding="utf-8")
+        people = [izin_data_v2.IzinPersonV2(tc, "ÖRNEK KİŞİ", "DIJITALPARK")
+                  for tc in ("31**", "42**")]
+        park = izin_data_v2.PARKS["DIJITALPARK"]
+        meta = {"ay_key": "Eylul", "donem_label": "EYLÜL 2026"}
+        engine = FakeEngine()
+        with patch.dict(os.environ, {"DGS_EXPECTED_COMPANY": company}):
+            results, _, recon = izin_otomasyon.run_park_entry(engine, None, park, people, meta,
+                                                                False, 0, None)
+        self.assertEqual([r["durum"] for r in results], ["zaten_girili", "dry_girilecek"])
+        self.assertEqual(engine.seen, ["42**"])
+        self.assertTrue(recon["tam_mutabakat"])
+
+        path.write_text("ÖRNEK KİŞİ\n", encoding="utf-8")
+        with patch.dict(os.environ, {"DGS_EXPECTED_COMPANY": company}):
+            with self.assertRaisesRegex(ValueError, "kimlik belirsiz"):
+                izin_otomasyon.run_park_entry(engine, None, park, people, meta, False, 0, None)
+        with patch.dict(os.environ, {"DGS_EXPECTED_COMPANY": "BAŞKA FİRMA ANONİM ŞİRKETİ"}):
+            other = FakeEngine()
+            results, _, _ = izin_otomasyon.run_park_entry(other, None, park, people, meta,
+                                                           False, 0, None)
+            self.assertEqual([r["durum"] for r in results], ["dry_girilecek"] * 2)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js bulunamadı")
+    def test_izin_partial_tc_requires_prefix_and_exact_name(self):
+        script = """
+          const payload=JSON.parse(process.argv[1]);
+          const nodes=payload.items.map(text=>({textContent:text, offsetParent:{},
+            querySelector(){return null}, dispatchEvent(){}}));
+          global.document={querySelectorAll(){return nodes}};
+          global.window={}; global.MouseEvent=class {};
+          const choose=%s;
+          console.log(choose(payload.args));
+        """ % izin_poc._PICK_LI_BY_TC_JS
+
+        def choose(items):
+            payload = {"items": items, "args": ["31**", ["ornek", "kisi"], "ornek kisi"]}
+            result = subprocess.run(["node", "-e", script, json.dumps(payload)],
+                                    capture_output=True, text=True, check=True, timeout=10)
+            return json.loads(result.stdout)
+
+        self.assertFalse(choose(["ÖRNEK KİŞİ 42*******18"])["ok"])
+        self.assertFalse(choose(["ÖRNEK KİŞİ EK 31*******18"])["ok"])
+        self.assertTrue(choose(["ÖRNEK KİŞİ 31*******18"])["ok"])
+        self.assertFalse(choose(["ÖRNEK KİŞİ 31*******18",
+                                 "ÖRNEK KİŞİ 31*******19"])["ok"])
 
 
 if __name__ == "__main__":

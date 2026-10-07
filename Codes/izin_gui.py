@@ -40,6 +40,7 @@ import izin_data_v2 as data
 import izin_belge
 import izin_frozen   # donmuş (.exe) uyumlu alt-süreç komutları + kalıcı resume klasörü
 import dgs_park      # DGS park kayıt defteri (dgs_poc'u SADECE run() içinde import eder → playwright gelmez)
+import portal_tenant  # Dijitalpark firma doğrulama ve şirkete özel devam dosyası
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -192,10 +193,15 @@ def dgs_donem_ay() -> str:
     return _TR_AYLAR[(t.month - 2) % 12]
 
 
-def dgs_done_sayisi(park_code: str, ay: str) -> int:
+def dgs_done_sayisi(park_code: str, ay: str, expected_company: str = "") -> int:
     """Resume dosyasındaki kişi sayısı — bunlar TEKRAR GİRİLMEZ (mükerrer kayıt kalkanı)."""
+    suffix = ""
+    if park_code == "Dijitalpark":
+        if not expected_company.strip():
+            return 0
+        suffix = "_" + portal_tenant.resume_suffix(expected_company)
     try:
-        with open(os.path.join(DATA_DIR, f"dgs_done_{park_code}_{ay}.txt"), encoding="utf-8") as fh:
+        with open(os.path.join(DATA_DIR, f"dgs_done_{park_code}_{ay}{suffix}.txt"), encoding="utf-8") as fh:
             return sum(1 for satir in fh if satir.strip())
     except OSError:
         return 0
@@ -397,6 +403,7 @@ class IzinGUI:
         # --- İZİN modülü ---
         self.excel_path = tk.StringVar()
         self.belge_path = tk.StringVar()   # per_person=klasör, ortak=dosya
+        self.expected_company = tk.StringVar()  # Dijitalpark: Excel'in ait olduğu şirketin portalda görünen tam unvanı
         self.commit = tk.BooleanVar(value=True)
         self.onayla = tk.BooleanVar(value=True)
 
@@ -800,6 +807,12 @@ class IzinGUI:
         ctk.CTkLabel(b2, text="Şifre uygulama tarafından görülmez. Açılan Chrome penceresinde giriş ve gerekiyorsa "
                               "Cloudflare doğrulamasını tamamlayın.", text_color=UI["muted"], wraplength=590,
                      justify="left", anchor="w", font=("Helvetica", 9)).pack(fill="x")
+        self.izin_company_row = ctk.CTkFrame(b2, fg_color="transparent")
+        ctk.CTkLabel(self.izin_company_row, text="Excel'in ait olduğu firmanın portalda görünen tam unvanı",
+                     text_color=UI["text"], anchor="w").pack(fill="x")
+        ctk.CTkEntry(self.izin_company_row, textvariable=self.expected_company, height=36,
+                     placeholder_text="Tam firma unvanı", fg_color=UI["input"],
+                     border_color=UI["border"], text_color=UI["text"]).pack(fill="x")
 
         # 5) ÇALIŞTIR — sağ sütunda, sahnenin dışında: her zaman görünür, kaydırma gerektirmez
         self.izin_run, b5 = self._card(self.run_stage, "05", "Çalıştır",
@@ -1210,6 +1223,10 @@ class IzinGUI:
 
     def _on_park_change(self):
         p = self._cur_park()
+        if p.code == "DIJITALPARK":
+            self.izin_company_row.pack(fill="x", pady=(10, 0))
+        else:
+            self.izin_company_row.pack_forget()
         if not p.onay_dogrulandi:
             self.onayla.set(False)
         self.onay_chk.configure(state="normal" if p.onay_dogrulandi else "disabled")
@@ -1716,6 +1733,12 @@ class IzinGUI:
                               "değişiminde tekrar çıkabilir; Chrome'da geçip login'i yeniden kontrol edin.",
                      text_color=UI["muted"], wraplength=590, justify="left", anchor="w",
                      font=("Helvetica", 9)).pack(fill="x")
+        self.dgs_company_row = ctk.CTkFrame(b2, fg_color="transparent")
+        ctk.CTkLabel(self.dgs_company_row, text="Excel'in ait olduğu firmanın portalda görünen tam unvanı",
+                     text_color=UI["text"], anchor="w").pack(fill="x")
+        ctk.CTkEntry(self.dgs_company_row, textvariable=self.expected_company, height=36,
+                     placeholder_text="Tam firma unvanı", fg_color=UI["input"],
+                     border_color=UI["border"], text_color=UI["text"]).pack(fill="x")
 
         # 03) DGS EXCEL — İZİN Excel'i DEĞİL
         d3, b3 = self._card(v, "03", "DGS Excel'i", "Puantaj kaynağı — izin Excel'inden AYRI dosya")
@@ -1841,8 +1864,12 @@ class IzinGUI:
 
     def _on_dgs_park_change(self):
         p = self._cur_dgs_park()
+        if p.code == "Dijitalpark":
+            self.dgs_company_row.pack(fill="x", pady=(10, 0))
+        else:
+            self.dgs_company_row.pack_forget()
         ay = dgs_donem_ay()
-        n = dgs_done_sayisi(p.code, ay)
+        n = dgs_done_sayisi(p.code, ay, self.expected_company.get())
         # --- YEDEK: text=f"{p.code} PORTALI"  (chip'te de ortak ad; sekmeler arası kod farkı görünmesin)
         self.dgs_park_chip.configure(text=f"{park_display(p)} PORTALI")
         resume = (f"Resume: {n} kişi zaten girilmiş → TEKRAR GİRİLMEZ." if n
@@ -1909,7 +1936,10 @@ class IzinGUI:
     # İSTİSNA KİŞİLER — otomasyonun DOKUNMAYACAĞI kişiler
     # ======================================================================
     def _istisna_dosyasi(self, park_code: str) -> str:
-        return os.path.join(DATA_DIR, f"dgs_istisna_{park_code}_{dgs_donem_ay()}.txt")
+        suffix = ""
+        if park_code == "Dijitalpark" and self.expected_company.get().strip():
+            suffix = "_" + portal_tenant.resume_suffix(self.expected_company.get())
+        return os.path.join(DATA_DIR, f"dgs_istisna_{park_code}_{dgs_donem_ay()}{suffix}.txt")
 
     def _istisna_oku(self, park_code: str):
         """Diskten yükle — uygulama kapanıp açılsa da istisnalar kaybolmasın."""
@@ -1973,10 +2003,12 @@ class IzinGUI:
         """Kişileri MOTORUN kendi okuyucusuyla al (`dgs ... liste`) → GUI ve motor BİREBİR aynı
         isimleri/T.C.'leri görür. Ayrı bir Excel parser yazsaydık isimler kayar, istisna tutmazdı."""
         cmd = izin_frozen.worker_cmd("dgs") + ["--park", park_code, "liste", "--excel", xl]
+        env = os.environ.copy()
+        env["DGS_EXPECTED_COMPANY"] = self.expected_company.get().strip()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
                                encoding="utf-8", errors="replace",
-                               stdin=subprocess.DEVNULL, cwd=DATA_DIR)
+                               stdin=subprocess.DEVNULL, cwd=DATA_DIR, env=env)
         except Exception as e:  # noqa
             return [], f"Liste alınamadı: {e}"
         for satir in (r.stdout or "").splitlines():
@@ -1990,6 +2022,11 @@ class IzinGUI:
 
     def _istisna_ac(self):
         p = self._cur_dgs_park()
+        if p.code == "Dijitalpark" and not self.expected_company.get().strip():
+            messagebox.showwarning("Firma unvanı gerekli",
+                                   "Dijitalpark istisna ve devam listesi firma bazlı tutulur. "
+                                   "Önce tam firma unvanını girin.")
+            return
         xl = os.path.expanduser(self.dgs_excel.get().strip())
         if not xl or not os.path.exists(xl):
             messagebox.showwarning("DGS Excel'i yok",
@@ -2210,6 +2247,13 @@ class IzinGUI:
         mod, _ = DGS_MODLAR[self.dgs_mod.get()]
         # commit'i buton belirler: BAŞLAT=gerçek, GÜVENLİ DENEME=yazmaz (operatör "commit" bilmek zorunda değil)
         self.dgs_commit.set(gercek)
+        if gercek and p.code == "Dijitalpark" and not self.expected_company.get().strip():
+            messagebox.showwarning("Firma unvanı gerekli",
+                                   "Dijitalpark'ta gerçek kayıt için Excel'in ait olduğu firmanın "
+                                   "portalda görünen tam unvanını girin.")
+            return
+        if p.code == "Dijitalpark":
+            self._on_dgs_park_change()  # firma alanı sonradan doldurulmuş olabilir
 
         limit = self.dgs_limit.get().strip()
         if limit and not limit.isdigit():
@@ -2303,6 +2347,12 @@ class IzinGUI:
         if not xl or not os.path.exists(os.path.expanduser(xl)):
             messagebox.showwarning("Excel yok", "Önce geçerli bir İzin Excel'i seç (3. adım).")
             return
+        if (not plan and self.commit.get() and self._cur_park().code == "DIJITALPARK"
+                and not self.expected_company.get().strip()):
+            messagebox.showwarning("Firma unvanı gerekli",
+                                   "Dijitalpark'ta gerçek kayıt için Excel'in ait olduğu firmanın "
+                                   "portalda görünen tam unvanını girin.")
+            return
         if not plan:
             if self.commit.get() and self.onayla.get():
                 if not messagebox.askyesno(
@@ -2358,6 +2408,7 @@ class IzinGUI:
         env = os.environ.copy()
         env["DGS_CDP"] = CDP_URL
         env["PYTHONUNBUFFERED"] = "1"
+        env["DGS_EXPECTED_COMPANY"] = self.expected_company.get().strip()
 
         def worker():
             try:
@@ -2448,7 +2499,9 @@ class IzinGUI:
             self._retry_baglami = None
             self._kapanis_asamasi = True
             self._log("\n[KAPANIŞ] ▶ Giriş bitti → SGK raporuyla kapanış kontrolü + eksik-retry başlıyor…\n")
-            kcmd = izin_frozen.worker_cmd("dgs") + ["--park", rb["park"], "kapanis", "--excel", rb["excel"]]
+            kcmd = dgs_park.kapanis_komutu(
+                izin_frozen.worker_cmd("dgs"), rb["park"], rb["excel"],
+                onayla=rb["onayla"], destek=rb["destek"])
             yol = self._istisna_dosyasi(rb["park"])              # istisna kişiler kapanış-retry'sinden de hariç
             if self.istisna and os.path.exists(yol):
                 kcmd += ["--exclude-file", yol]

@@ -37,6 +37,7 @@ Kullanım:
 from __future__ import annotations
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -111,6 +112,12 @@ def assert_logged_in(page: Page):
         raise CloudflareHalt("Cloudflare/giriş ekranı. Elle geç, dashboard açıkken tekrar koş.")
     if page.locator("text=PERSONEL").count() == 0:
         raise CloudflareHalt("Dashboard görülemedi (PERSONEL menüsü yok). Giriş yap, tekrar koş.")
+    if CONFIG.get("require_company_guard"):
+        import portal_tenant
+        try:
+            portal_tenant.assert_expected_company(page, CONFIG.get("expected_company", ""))
+        except portal_tenant.CompanyMismatch as e:
+            raise CloudflareHalt(str(e)) from e
 
 
 def _open_menu_item(page: Page, item_text: str):
@@ -304,27 +311,32 @@ _LI_VISIBLE_JS = r"""(toks) => {
 _TARGET_VISIBLE_JS = r"""(args) => {
   const [tc, toks] = args;
   const f2=tc?tc.slice(0,2):'', l2=tc?tc.slice(-2):'';
+  const prefixOnly=/^\d{2}\*+$/.test(tc);
   const fold=s=>{const tr={'ç':'c','Ç':'c','ğ':'g','Ğ':'g','ı':'i','İ':'i','I':'i','ö':'o','Ö':'o','ş':'s','Ş':'s','ü':'u','Ü':'u'};
     return s.split('').map(c=>tr[c]||c).join('').toLowerCase();};
   return [...document.querySelectorAll('ul.ui-autocomplete li, ul.ui-menu li')].filter(x=>x.offsetParent!==null)
     .some(li=>{const m=li.textContent.match(/(\d{2})\*+(\d{2})/);
-      const tcM = tc && m && m[1]===f2 && m[2]===l2;
+      const tcM = tc && m && m[1]===f2 && (prefixOnly || m[2]===l2);
       const nmM = toks.length && toks.every(t=>fold(li.textContent).includes(t));
       return tcM || nmM;});
 }"""
 
 # Seç: T.C.-maske eşleşen + isim-token örtüşen (ÇİFT-KONTROL). T.C. yoksa saf tüm-token. JSON string döner.
 _PICK_LI_BY_TC_JS = r"""(args) => {
-  const [tc, toks] = args;
+  const [tc, toks, wanted] = args;
   const f2=tc?tc.slice(0,2):'', l2=tc?tc.slice(-2):'';
+  const prefixOnly=/^\d{2}\*+$/.test(tc);
   const fold=s=>{const tr={'ç':'c','Ç':'c','ğ':'g','Ğ':'g','ı':'i','İ':'i','I':'i','ö':'o','Ö':'o','ş':'s','Ş':'s','ü':'u','Ü':'u'};
     return s.split('').map(c=>tr[c]||c).join('').toLowerCase();};
   const lis=[...document.querySelectorAll('ul.ui-autocomplete li, ul.ui-menu li')].filter(x=>x.offsetParent!==null);
-  const cand=lis.map(li=>{const m=li.textContent.match(/(\d{2})\*+(\d{2})/);
-    return {li, tcM:(tc && m && m[1]===f2 && m[2]===l2), ov:toks.filter(t=>fold(li.textContent).includes(t)).length};});
+  const cand=lis.map(li=>{const raw=li.textContent||'', m=raw.match(/(\d{2})\*+(\d{2})/);
+    const name=fold(raw.replace(/\d{2}\*+\d{2}.*/, '').trim()).replace(/\s+/g,' ').trim();
+    return {li, tcM:(tc && m && m[1]===f2 && (prefixOnly || m[2]===l2)),
+            exactName:name===wanted, ov:toks.filter(t=>name.includes(t)).length};});
   const byTc=cand.filter(c=>c.tcM);
-  const exact=byTc.filter(c=>c.ov===toks.length);
-  let pick = tc ? (exact.length===1 ? exact : byTc.length===1 ? byTc : [])
+  const exact=byTc.filter(c=>prefixOnly ? c.exactName : c.ov===toks.length);
+  let pick = prefixOnly ? (exact.length===1 ? exact : [])
+             : tc ? (exact.length===1 ? exact : byTc.length===1 ? byTc : [])
                 : cand.filter(c=>c.ov===toks.length);
   pick.sort((a,b)=>b.ov-a.ov);
   if(pick.length!==1) return JSON.stringify({ok:false, reason:(tc?'tc-maske eşleşmedi veya belirsiz':'ad eşleşmedi veya belirsiz')});
@@ -381,7 +393,8 @@ def select_personel(page: Page, portal_ad: str, tc: str | None = None):
         pass
     first = portal_ad.split()[0]
     tcs = str(tc).strip() if tc else ""
-    use_tc = tcs.isdigit() and len(tcs) == 11        # v2 T.C. varsa KİMLİK bazlı seçim (isim yedek/çift-kontrol)
+    partial_tc = bool(re.fullmatch(r"\d{2}\*+", tcs))
+    use_tc = (tcs.isdigit() and len(tcs) == 11) or partial_tc
     tc_arg = tcs if use_tc else ""
     # soyad → ilk-ad → tam-ad: SOYAD bazı isimlerde hedefi getirmiyor (2026-07-09: 'Makam'→ÖMER FARUK MAKAM,
     # GAMZE AYTEKİN MAKAM değil çünkü portalda "GAMZE AYTEKİN" kızlık adıyla → ilk-ad ile bulunur, T.C. ile teyit).
@@ -410,7 +423,7 @@ def select_personel(page: Page, portal_ad: str, tc: str | None = None):
             last_err = f"'{term}' → hedef yok; menüde: {shown}"
             log(f"  (ara '{term}': hedef çıkmadı; menüde {len(shown)} kayıt: {shown[:4]})")
             _clear_personel(page); page.wait_for_timeout(800); continue
-        pick = json.loads(page.evaluate(_PICK_LI_BY_TC_JS, [tc_arg, tokens]))
+        pick = json.loads(page.evaluate(_PICK_LI_BY_TC_JS, [tc_arg, tokens, fold(portal_ad)]))
         if not pick.get("ok"):
             last_err = f"seçilemedi ({pick.get('reason')})"
             _clear_personel(page); page.wait_for_timeout(800); continue
@@ -431,7 +444,10 @@ def select_personel(page: Page, portal_ad: str, tc: str | None = None):
             _clear_personel(page); page.wait_for_timeout(1000); continue
         # ÇİFT-KONTROL: T.C. eşleştiyse en az 1 isim-token örtüşmeli (0=güvenlik dur); T.C. yoksa TÜM token (eski katı)
         overlap = sum(1 for t in tokens if t in fold(s["val"]))
-        if use_tc:
+        if partial_tc:
+            if fold(s["val"]) != fold(portal_ad):
+                raise VerifyError(f"Kısmi T.C. ile seçilen personel adı tam eşleşmedi: beklenen '{portal_ad}', input='{s['val']}'")
+        elif use_tc:
             if overlap == 0:
                 raise VerifyError(f"T.C. eşleşti ama isim HİÇ tutmuyor: beklenen '{portal_ad}', input='{s['val']}' — GÜVENLİK DUR")
         elif overlap < len(tokens):

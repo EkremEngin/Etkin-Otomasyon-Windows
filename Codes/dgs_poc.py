@@ -444,6 +444,12 @@ def assert_logged_in(page: Page):
     # (gerçek Cloudflare/login ise yukarıdaki body/title kontrolü zaten DURDURMUŞ olurdu)
     for _ in range(8):
         if page.locator("text=PERSONEL").count() > 0:
+            if CONFIG.get("require_company_guard"):
+                import portal_tenant
+                try:
+                    portal_tenant.assert_expected_company(page, CONFIG.get("expected_company", ""))
+                except portal_tenant.CompanyMismatch as e:
+                    raise CloudflareHalt(str(e)) from e
             return
         page.wait_for_timeout(1000)
     raise CloudflareHalt("Dashboard görülemedi (PERSONEL menüsü yok). Giriş yap, tekrar koş.")
@@ -1559,6 +1565,8 @@ def main():
     CONFIG["assume_standard"] = args.assume_std or args.no_schedule
     CONFIG["include_destek"] = args.include_destek
     CONFIG["auto_onay"] = args.onayla
+    CONFIG["require_company_guard"] = args.commit and args.lokasyon.casefold() == "dijitalpark"
+    CONFIG["expected_company"] = os.environ.get("DGS_EXPECTED_COMPANY", "").strip()
 
     donem_label, ay_regex, ay_no = donem_label_and_regex(args.donem)
     CONFIG["donem_text"] = donem_label
@@ -1600,8 +1608,19 @@ def main():
     if not targets:
         sys.exit(1)
 
-    done_file = f"dgs_done_{args.lokasyon}_{sheet}.txt"
-    done = set(open(done_file, encoding="utf-8").read().splitlines()) if os.path.exists(done_file) else set()
+    company_suffix = ""
+    if args.lokasyon.casefold() == "dijitalpark":
+        import portal_tenant
+        if CONFIG["expected_company"]:
+            company_suffix = "_" + portal_tenant.resume_suffix(CONFIG["expected_company"])
+        elif args.commit:
+            log("HATA: Dijitalpark gerçek kayıt için beklenen tam firma unvanı gerekli.")
+            sys.exit(2)
+    done_file = (f"dgs_done_{args.lokasyon}_{sheet}{company_suffix}.txt"
+                 if company_suffix or args.lokasyon.casefold() != "dijitalpark" else None)
+    onay_done_file = (f"dgs_onaya_done_{args.lokasyon}_{sheet}{company_suffix}.txt"
+                      if done_file else None)
+    done = set(open(done_file, encoding="utf-8").read().splitlines()) if done_file and os.path.exists(done_file) else set()
     if done:
         log(f"{len(done)} kişi zaten işlenmiş (atlanacak).")
 
@@ -1665,7 +1684,7 @@ def main():
                     with open(done_file, "a", encoding="utf-8") as f:
                         f.write(person.ad_soyad + "\n")
                     if r.get("onaylandi"):   # --onayla başarılı → onay-resume'a da yaz (dgs_onaya çift-göndermez)
-                        with open(f"dgs_onaya_done_{args.lokasyon}_{sheet}.txt", "a", encoding="utf-8") as f:
+                        with open(onay_done_file, "a", encoding="utf-8") as f:
                             f.write(person.ad_soyad + "\n")
 
             ok = sum(1 for r in results if r["ok"])

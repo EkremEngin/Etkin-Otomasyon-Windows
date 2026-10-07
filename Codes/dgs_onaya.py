@@ -11,7 +11,7 @@ Akış (kullanıcı canlı gösterdi 2026-06-18):
   E-İMZA = İNSAN ADIMI (script atmaz). 'Onaya Gönder' tıklanamıyorsa SIRADAKİ kişiye geçer.
 
 DÖNEM otomatik: bugünden bir ÖNCEKİ takvim ayı (ör. Haziran'dayız → MAYIS 2026). İleri dönemler
-için de kendiliğinden doğru ayı seçer. Listede o etiket yoksa, dropdown'daki SON aydan bir öncekine düşer.
+için de kendiliğinden doğru ayı seçer. Listede o etiket yoksa yanlış aya geçmeden durur.
 
 GÜVENLİK (verify-or-halt):
   - Yalnız dgs_done_<lok>_<sheet>.txt'deki isimleri işler; listede bizim-olmayan kayda DOKUNMAZ.
@@ -27,6 +27,7 @@ Kullanım:
 """
 from __future__ import annotations
 import argparse
+from collections import Counter
 import datetime
 import os
 import re
@@ -128,21 +129,14 @@ def donem_options(page) -> list[dict]:
 
 
 def set_donem(page, label: str) -> str:
-    """Listesi filtresinde Dönem'i seç (Playwright select_option — kullanıcının elle seçimiyle aynı).
-    Etiket yoksa dropdown'daki SON aydan bir öncekisine düşer (ileri dönem güvenliği)."""
+    """Listesi filtresinde yalnız istenen Dönem'i seç; bulunamazsa güvenle dur."""
     opts = donem_options(page)
-    val = next((o["value"] for o in opts if o["text"] == label), None)
-    chosen = label
-    if not val:
-        try:
-            ordered = sorted([o for o in opts if o["value"].isdigit()], key=lambda o: int(o["value"]))
-            if len(ordered) >= 2:
-                val, chosen = ordered[-2]["value"], ordered[-2]["text"]
-                log(f"  UYARI: '{label}' dönem listesinde yok → '{chosen}' seçildi (son-aydan-önceki).")
-        except Exception:
-            pass
-    if not val:
-        raise D.VerifyError(f"Dönem ayarlanamadı: '{label}' yok. Mevcut: {[o['text'] for o in opts]}")
+    matches = [o for o in opts if fold(o["text"]) == fold(label)]
+    if len(matches) != 1:
+        raise D.VerifyError(f"Dönem ayarlanamadı: '{label}' için {len(matches)} eşleşme. "
+                            f"Mevcut: {[o['text'] for o in opts]}")
+    val = matches[0]["value"]
+    chosen = matches[0]["text"]
     page.locator('div.ui-dialog select[name="Donem_Id"]').last.select_option(value=val, timeout=6000)
     page.wait_for_timeout(500)
     got = page.evaluate(
@@ -190,15 +184,16 @@ _NAME_RE = re.compile(r"^(.+?)\s+[\d\*]{3,}")
 
 def read_list_rows(page) -> list[dict]:
     """Sonuç grid'ini oku — flexigrid GÖVDESİ (.flexigrid .bDiv). Gizli id kolonları nedeniyle:
-       id=td[0], Personel=td[6], Onay Durumu=td[12], OnayDurumu_Id=td[13], Toplam=td[15].
+       id=td[0], Proje=td[4], Personel=td[6], Onay Durumu=td[12], OnayDurumu_Id=td[13], Toplam=td[15].
     İsim TC'den arındırılır + fold'lanır."""
     raw = page.evaluate(
         r"""()=>{const dlg=[...document.querySelectorAll('div.ui-dialog')].filter(d=>d.offsetParent!==null && /Dışarıda Geçirilen Süreler Listesi/.test(d.querySelector('.ui-dialog-titlebar')?.textContent||''))[0];
             if(!dlg)return [];
             const body=dlg.querySelector('.flexigrid .bDiv'); if(!body)return [];
             return [...body.querySelectorAll('tr')]
-              .filter(tr=>tr.children.length>=13 && /FEV TR/.test(tr.children[4]?.textContent||''))
+              .filter(tr=>tr.children.length>=13)
               .map(tr=>({id:(tr.children[0]?.textContent||'').trim(),
+                         project:(tr.children[4]?.textContent||'').replace(/\s+/g,' ').trim(),
                          pers:(tr.children[6]?.textContent||'').replace(/\s+/g,' ').trim(),
                          onay:(tr.children[12]?.textContent||'').replace(/\s+/g,' ').trim(),
                          onayId:(tr.children[13]?.textContent||'').trim(),
@@ -207,15 +202,21 @@ def read_list_rows(page) -> list[dict]:
     for r in raw:
         m = _NAME_RE.match(r["pers"])
         ad = (m.group(1) if m else r["pers"]).strip()
-        out.append({"id": r["id"], "pers_raw": r["pers"], "ad": ad, "ad_fold": fold(ad),
+        out.append({"id": r["id"], "project": r["project"], "pers_raw": r["pers"],
+                    "ad": ad, "ad_fold": fold(ad),
                     "onay": r["onay"], "onayId": r["onayId"], "total": r["total"]})
     return out
 
 
-def dblclick_row(page, ad_fold: str) -> bool:
-    """İsme göre flexigrid GÖVDE satırını çift-tıkla (Personel=td[6], TC'den arındırılmış fold eşleşmesi)."""
+def _project_matches(row: dict, expected_projects: dict[str, str]) -> bool:
+    """Portal satırındaki proje, Excel'deki o kişinin projesiyle eşleşmeli."""
+    return row["ad_fold"] in expected_projects and fold(row["project"]) == expected_projects[row["ad_fold"]]
+
+
+def dblclick_row(page, ad_fold: str, project_fold: str) -> bool:
+    """Personel ve projeye göre doğru flexigrid satırını çift-tıkla."""
     return page.evaluate(
-        r"""(args)=>{const [target] = args;
+        r"""(args)=>{const [target, project] = args;
             const fold=s=>{const tr={'ç':'c','Ç':'c','ğ':'g','Ğ':'g','ı':'i','İ':'i','I':'i','ö':'o','Ö':'o','ş':'s','Ş':'s','ü':'u','Ü':'u'};
               return s.replace(/̇/g,'').split('').map(c=>tr[c]||c).join('').toLowerCase().replace(/\s+/g,' ').trim();};
             const dlg=[...document.querySelectorAll('div.ui-dialog')].filter(d=>d.offsetParent!==null && /Dışarıda Geçirilen Süreler Listesi/.test(d.querySelector('.ui-dialog-titlebar')?.textContent||''))[0];
@@ -223,11 +224,12 @@ def dblclick_row(page, ad_fold: str) -> bool:
             for(const tr of body.querySelectorAll('tr')){
               if(tr.children.length<13)continue;
               const nm=fold((tr.children[6]?.textContent||'').replace(/\s+[\d\*]{3,}.*$/,''));
-              if(nm===target){ tr.scrollIntoView({block:'center'});
+              const proj=fold(tr.children[4]?.textContent||'');
+              if(nm===target && proj===project){ tr.scrollIntoView({block:'center'});
                 for(const t of ['mouseover','mousedown','mouseup','click','dblclick'])
                   tr.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));
                 return true; }}
-            return false;}""", [ad_fold])
+            return false;}""", [ad_fold, project_fold])
 
 
 def wait_form_open(page, timeout_ms: int = 7000) -> bool:
@@ -308,22 +310,62 @@ def main():
     ap.add_argument("--donem", default=None, help="Dönem etiketi override (ör. 'MAYIS 2026'); yoksa oto önceki ay")
     args = ap.parse_args()
     dry = not args.commit
-
-    done_file = f"dgs_done_{args.lokasyon}_{args.sheet}.txt"
-    if not os.path.exists(done_file):
-        log(f"HATA: {done_file} yok."); sys.exit(1)
-    our = set(fold(l.strip()) for l in open(done_file, encoding="utf-8") if l.strip())
-    onay_file = f"dgs_onaya_done_{args.lokasyon}_{args.sheet}.txt"
-    already = set(fold(l) for l in open(onay_file, encoding="utf-8").read().splitlines()) if os.path.exists(onay_file) else set()
+    expected_company = os.environ.get("DGS_EXPECTED_COMPANY", "")
+    resume_tag = ""
+    if args.lokasyon == "Dijitalpark":
+        from portal_tenant import CompanyMismatch, assert_expected_company, resume_suffix
+        if dry and not expected_company.strip():
+            resume_tag = None  # şirket bilinmeden yalnız Excel/portal önizlemesi yapılır
+        else:
+            try:
+                resume_tag = f"_{resume_suffix(expected_company)}"
+            except CompanyMismatch as e:
+                raise D.VerifyError(str(e)) from e
+    expected_projects = {}
+    if args.lokasyon == "Dijitalpark":
+        try:
+            excel_people = D.read_excel(args.excel, args.sheet, args.lokasyon)
+        except Exception as e:
+            raise D.VerifyError(f"Onay Excel'i okunamadı: {e}") from e
+        expected_projects = {fold(p.ad_soyad): fold(p.proje_adi) for p in excel_people.values()
+                             if p.lokasyon.upper() == args.lokasyon.upper()}
+    if resume_tag is None:
+        our = set(expected_projects)
+        already = set()
+        onay_file = None
+        log("Dijitalpark güvenli önizleme: şirket unvanı girilmedi; kişiler Excel'den alındı, "
+            "şirkete ait devam/onay dosyaları okunmadı.")
+    else:
+        done_file = f"dgs_done_{args.lokasyon}_{args.sheet}{resume_tag}.txt"
+        if not os.path.exists(done_file):
+            log(f"HATA: {done_file} yok."); sys.exit(1)
+        with open(done_file, encoding="utf-8") as f:
+            our = {fold(line.strip()) for line in f if line.strip()}
+        onay_file = f"dgs_onaya_done_{args.lokasyon}_{args.sheet}{resume_tag}.txt"
+        if os.path.exists(onay_file):
+            with open(onay_file, encoding="utf-8") as f:
+                already = {fold(line.strip()) for line in f if line.strip()}
+        else:
+            already = set()
+    missing_excel = our - expected_projects.keys() if args.lokasyon == "Dijitalpark" else set()
+    if missing_excel:
+        raise D.VerifyError(f"Done dosyasındaki {len(missing_excel)} kişi seçili parkın Excel'inde yok; "
+                            "yanlış kişiyi/projeyi onaylamamak için durdu.")
     label = args.donem or prev_month_label()
     limit = args.limit if args.limit else 10**9
-    log(f"Dönem: {label} | done={len(our)} | zaten-onaya-gönderilmiş={len(already)} | "
+    source_label = "Excel" if resume_tag is None else "done"
+    log(f"Dönem: {label} | {source_label}={len(our)} | zaten-onaya-gönderilmiş={len(already)} | "
         f"MOD={'DRY-RUN (gönderme YOK)' if dry else 'COMMIT (GERÇEK)'}")
 
     with sync_playwright() as pw:
         _browser, page = D.attach_browser(pw)
         page.on("dialog", lambda d: d.accept())   # native confirm() çıkarsa kabul et (submit'i iptal etme)
         D.assert_logged_in(page)
+        if not dry and args.lokasyon == "Dijitalpark":
+            try:
+                assert_expected_company(page, expected_company)
+            except CompanyMismatch as e:
+                raise D.VerifyError(str(e)) from e
 
         # ---- DRY-RUN: tüm statülerle listele, done setiyle eşleştir, statü dağılımı raporla ----
         if dry:
@@ -332,18 +374,26 @@ def main():
             set_status_filter(page, only_draft=False)
             listele(page)
             rows = read_list_rows(page)
+            if args.lokasyon != "Dijitalpark":
+                rows = [r for r in rows if "FEV TR" in r["project"]]
             log(f"Listede bu sayfada {len(rows)} kayıt | {footer_total(page)} (dönem={label}, tüm statüler).")
-            ours = [r for r in rows if r["ad_fold"] in our]
+            if args.lokasyon == "Dijitalpark":
+                ours = [r for r in rows if r["ad_fold"] in our and _project_matches(r, expected_projects)]
+                wrong_project = [r for r in rows if r["ad_fold"] in our and not _project_matches(r, expected_projects)]
+            else:
+                ours = [r for r in rows if r["ad_fold"] in our]
+                wrong_project = []
             yabanci = [r for r in rows if r["ad_fold"] not in our]
-            from collections import Counter
             dist = Counter(r["onay"] for r in ours)
-            log(f"Bizim done'dan eşleşen: {len(ours)} | listede bizim-olmayan: {len(yabanci)}")
+            log(f"Bizim {source_label} hedeflerinden eşleşen: {len(ours)} | listede bizim-olmayan: {len(yabanci)}")
+            if wrong_project:
+                log(f"Excel projesi uyuşmayan {len(wrong_project)} satır onay kapsamı dışında.")
             log("Eşleşenlerin statü dağılımı:")
             for st, c in dist.most_common():
                 log(f"    {c:>3}  {st}")
-            eksik = sorted(n for n in our if n not in {r['ad_fold'] for r in rows})
+            eksik = sorted(n for n in our if n not in {r['ad_fold'] for r in ours})
             if eksik:
-                log(f"Listede HİÇ görünmeyen done-kişi: {len(eksik)} (ilk 10: {eksik[:10]})")
+                log(f"Listede HİÇ görünmeyen {source_label} kişisi: {len(eksik)} (ilk 10: {eksik[:10]})")
             log("Örnek 5 eşleşen:")
             for r in ours[:5]:
                 log(f"    {r['pers_raw'][:32]:<32} | {r['onay']}")
@@ -367,8 +417,25 @@ def main():
             set_status_filter(page, only_draft=True)   # yalnız "Değerlendirmeye Gönderilmemiş"
             listele(page)
             rows = read_list_rows(page)
+            if args.lokasyon != "Dijitalpark":
+                rows = [r for r in rows if "FEV TR" in r["project"]]
+            if args.lokasyon == "Dijitalpark":
+                eligible = [r for r in rows if r["ad_fold"] in our and _project_matches(r, expected_projects)]
+                match_count = Counter(r["ad_fold"] for r in eligible)
+                for name in {r["ad_fold"] for r in rows if r["ad_fold"] in our}:
+                    if name in already:
+                        continue
+                    count = match_count[name]
+                    if count == 0 and name not in failed:
+                        failed.add(name)
+                        log(f"!! {name}: portal taslağındaki proje Excel ile uyuşmuyor — atlandı")
+                    elif count > 1 and name not in failed:
+                        failed.add(name)
+                        log(f"!! {name}: aynı kişi/projede {count} taslak var — mükerrer kontrolü için atlandı")
+            else:
+                eligible = [r for r in rows if r["ad_fold"] in our]
             # işlenecek ilk satır: bizim setten, daha önce onaya gitmemiş, bu koşuda failed olmamış
-            target = next((r for r in rows if r["ad_fold"] in our
+            target = next((r for r in eligible if r["ad_fold"] in our
                            and r["ad_fold"] not in already and r["ad_fold"] not in failed), None)
             if not target:
                 yabanci = [r for r in rows if r["ad_fold"] not in our]
@@ -378,7 +445,7 @@ def main():
             # GÜVENLİK 1: liste satırının Toplam'ı (td[15]) dolu mu — BOŞ kayıt onaya gitmesin
             if not target["total"] or target["total"] in ("0:00", "00:00"):
                 failed.add(target["ad_fold"]); log(f"!! {ad}: liste toplamı boş/0 ({target['total']!r}) — atlandı"); continue
-            if not dblclick_row(page, target["ad_fold"]):
+            if not dblclick_row(page, target["ad_fold"], fold(target["project"])):
                 failed.add(target["ad_fold"]); log(f"!! {ad}: satır çift-tıklanamadı, atlandı"); continue
             if not wait_form_open(page):
                 failed.add(target["ad_fold"]); log(f"!! {ad}: form ~7sn'de açılmadı, atlandı"); close_form_only(page); continue
@@ -393,6 +460,11 @@ def main():
             # 'Onaya Gönder' tıklanabilir mi? (kullanıcı kuralı: değilse sıradakine geç)
             if not onaya_gonder_clickable(page):
                 failed.add(target["ad_fold"]); log(f"!! {ad}: 'Onaya Gönder' tıklanamıyor (pasif), atlandı"); close_form_only(page); continue
+            if args.lokasyon == "Dijitalpark":
+                try:
+                    assert_expected_company(page, expected_company)
+                except CompanyMismatch as e:
+                    raise D.VerifyError(str(e)) from e
             click_onaya_gonder(page)
             # DOĞRULAMA: form statüsü taslaktan çıkana kadar ~6sn poll (async güncelleme → false-negative önle)
             st_after = ""
@@ -411,6 +483,12 @@ def main():
             already.add(target["ad_fold"])
             log(f"[{ok}] {ad} → GÖNDERİLDİ ✓ (Toplam={target['total']}, statü={st_after})")
 
+        if args.lokasyon == "Dijitalpark" and ok < limit:
+            pending = our - already - failed
+            if pending:
+                failed.update(pending)
+                log(f"  !! Portal taslak listesinde doğrulanamayan {len(pending)} kişi var; "
+                    "onaya gönderilmedi, elle kontrol edin.")
         log(f"\n==== ÖZET: bu koşuda {ok} kişi onaya gönderildi ====")
         if failed:
             log(f"  !! GÖNDERİLEMEYEN/atlanan ({len(failed)}): elle bak.")
@@ -418,6 +496,8 @@ def main():
             "Yine de SGK raporundan teyit önerilir.")
         try: input(f"{LOG} >> Bitti. ENTER ile kapat...")
         except EOFError: pass
+        if failed and args.lokasyon == "Dijitalpark":
+            sys.exit(1)
 
 
 if __name__ == "__main__":

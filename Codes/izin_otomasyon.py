@@ -85,6 +85,8 @@ def configure_engine(izin_poc, park: Park, meta: dict, commit: bool, cdp: str):
     izin_poc.CONFIG["ay_regex"] = meta["ay_regex"]          # ^\d{2}\.06\.2026$
     izin_poc.CONFIG["portal_url"] = park.portal_url
     izin_poc.CONFIG["dry_run"] = not commit
+    izin_poc.CONFIG["require_company_guard"] = commit and park.code == "DIJITALPARK"
+    izin_poc.CONFIG["expected_company"] = os.environ.get("DGS_EXPECTED_COMPANY", "").strip()
     if cdp:
         izin_poc.CONFIG["cdp_url"] = cdp
 
@@ -96,15 +98,40 @@ def run_park_entry(izin_poc, page, park: Park, targets, meta: dict, commit: bool
                    limit: int, only_person: str | None):
     """Parkın hedeflerini gir (TASLAK). Dönüş: (results, done_names_now, recon)."""
     ay_key = meta["ay_key"]
-    done_file = f"izin_done_{park.label}_{ay_key}.txt"
+    company_suffix = ""
+    if park.code == "DIJITALPARK":
+        import portal_tenant
+        expected = os.environ.get("DGS_EXPECTED_COMPANY", "").strip()
+        if expected:
+            company_suffix = "_" + portal_tenant.resume_suffix(expected)
+        elif commit:
+            raise ValueError("Dijitalpark gerçek kayıt için beklenen tam firma unvanı gerekli.")
+    done_file = (f"izin_done_{park.label}_{ay_key}{company_suffix}.txt"
+                 if company_suffix or park.code != "DIJITALPARK" else None)
     done = set()
-    if os.path.exists(done_file):
-        # "TC\tAd" veya düz "Ad" satırları — ikisini de destekle
-        for line in open(done_file, encoding="utf-8"):
-            line = line.strip()
-            if not line:
-                continue
-            done.add(line.split("\t")[-1])              # ad kısmı (izin_onaya uyumu)
+    legacy_done_names = set()
+    if done_file and os.path.exists(done_file):
+        # Yeni kayıtlar T.C. + ad taşır; eski düz-ad satırları yalnız tekil isimde güvenlidir.
+        with open(done_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                tc, sep, ad = line.partition("\t")
+                if sep and tc.strip() and ad.strip():
+                    done.add((tc.strip(), fold(ad)))
+                else:
+                    legacy_done_names.add(fold(line))
+
+    name_counts = {}
+    for person in targets:
+        name = fold(person.ad)
+        name_counts[name] = name_counts.get(name, 0) + 1
+    ambiguous_legacy = sorted(name for name in legacy_done_names if name_counts.get(name, 0) > 1)
+    if ambiguous_legacy:
+        raise ValueError("Eski izin devam dosyasında yalnız ad bulunan birden fazla aynı adlı kişi var; "
+                         "kimlik belirsiz. Portala dokunulmadı. Devam dosyasındaki ilgili satırları "
+                         "T.C.\\tAd biçiminde düzeltin.")
 
     work = list(targets)
     if only_person:
@@ -116,19 +143,24 @@ def run_park_entry(izin_poc, page, park: Park, targets, meta: dict, commit: bool
     if limit:
         work = work[:limit]
 
+    def is_done(person):
+        name = fold(person.ad)
+        return ((person.tc.strip(), name) in done
+                or (name in legacy_done_names and name_counts[name] == 1))
+
     log(f"\n{'='*70}\n### PARK: {park.code} ({park.ad}) — {len(targets)} kişi | dönem {meta['donem_label']} "
         f"| commit={commit} (False=DRY-RUN)\n{'='*70}")
-    if done:
-        log(f"{len(done)} kişi zaten girilmiş (resume, atlanacak).")
+    done_count = sum(is_done(person) for person in work)
+    if done_count:
+        log(f"{done_count} kişi zaten girilmiş (devam dosyası, atlanacak).")
     _runlog(park, meta, commit, {"olay": "run_start", "hedef": len(work),
-                                 "resume_atlanacak": len(done), "toplam_park_kisi": len(targets)})
+                                 "resume_atlanacak": done_count, "toplam_park_kisi": len(targets)})
 
     results = []
     done_now = []
-    first_done_before = bool(done)  # form ilk açılışını yönetmek için
     first = True
     for i, person in enumerate(work, 1):
-        if person.ad in done:
+        if is_done(person):
             results.append({"tc": person.tc, "ad": person.ad, "durum": "zaten_girili",
                             "ok": True, "kaydedildi": False, "flag": [], "mesaj": "resume: zaten girilmiş"})
             _runlog(park, meta, commit, {"olay": "kisi", "i": i, "ad": person.ad, "tc": person.tc,
@@ -492,8 +524,12 @@ def main():
         except izin_poc.CloudflareHalt as e:
             log(f"🛑 {e}"); sys.exit(1)
 
-        results, done_now, recon = run_park_entry(izin_poc, page, active, targets, meta,
-                                                   args.commit, args.limit, args.person)
+        try:
+            results, done_now, recon = run_park_entry(izin_poc, page, active, targets, meta,
+                                                       args.commit, args.limit, args.person)
+        except ValueError as e:
+            log(f"❌ DEVAM DOSYASI HATASI — portala dokunulmadı: {e}")
+            sys.exit(2)
         print_recon(recon)
 
         # PDF'siz onay AYNI oturumda (inline). PDF'li onay oturum kapandıktan SONRA (subprocess, eş-zamanlı bağlantı yok).
