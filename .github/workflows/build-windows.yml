@@ -48,11 +48,11 @@ jobs:
           print('SURUM =', m.group(1) if m else 'BULUNAMADI')
         # Bu satır koşu log'una düşer → indirilen exe'nin hangi koda karşılık geldiği kayda geçer.
 
-      - name: Dijitalpark veri ve kişi mutabakatı testleri
+      - name: Dijitalpark veri, şirket ve kişi mutabakatı testleri
         working-directory: Codes
         env:
           PYTHONIOENCODING: utf-8
-        run: python -m unittest -q test_dijitalpark
+        run: python -m unittest -q test_dijitalpark test_dgs_kapanis test_dgs_onaya test_portal_tenant
 
       - name: Derle
         working-directory: Codes
@@ -116,7 +116,7 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: |
-          import datetime, json, pathlib, subprocess, tempfile
+          import datetime, json, os, pathlib, subprocess, tempfile
           from openpyxl import Workbook
           exe = pathlib.Path('dist/Etkin Otomasyon.exe').resolve()
           with tempfile.TemporaryDirectory() as temp:
@@ -139,12 +139,20 @@ jobs:
               result = subprocess.run([str(exe), 'dgs', '--park', 'Dijitalpark', 'liste',
                                        '--excel', str(dgs_path), '--donem', 'EYLÜL 2026'],
                                       cwd=temp, capture_output=True, text=True, encoding='utf-8',
-                                      errors='replace', timeout=60)
+                                      errors='replace', timeout=60,
+                                      env={**os.environ, 'DGS_EXPECTED_COMPANY': 'ÖRNEK PROJE A.Ş.'})
               if result.returncode:
                   raise RuntimeError(result.stdout + result.stderr)
               data = json.loads(result.stdout.split('<<<LISTE>>>', 1)[1])
               assert data['park'] == 'Dijitalpark' and len(data['kisiler']) == 1, data
               assert data['kisiler'][0]['eksik'] == '168:11', data
+              blocked = subprocess.run([str(exe), 'dgs', '--park', 'Dijitalpark', 'giris',
+                                        '--excel', str(dgs_path), '--donem', 'EYLÜL 2026', '--commit'],
+                                       cwd=temp, capture_output=True, text=True, encoding='utf-8',
+                                       errors='replace', timeout=60,
+                                       env={k: v for k, v in os.environ.items()
+                                            if k != 'DGS_EXPECTED_COMPANY'})
+              assert blocked.returncode == 2 and 'beklenen tam firma unvanı' in blocked.stdout, blocked.stdout
 
               izin = Workbook()
               ws = izin.active
