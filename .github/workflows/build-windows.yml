@@ -90,8 +90,8 @@ jobs:
                   wb = Workbook()
                   wb.active.title = title
                   wb.active.append(headers)
-                  for park in ['TPIz', 'Ulutek']:
-                      wb.active.append(['ÖRNEK ' + park, '12345678901', 'Bölüm', park,
+                  for park, tc in [('TPIz', '12345678901'), ('Ulutek', '22345678901')]:
+                      wb.active.append(['ÖRNEK ' + park, tc, 'Bölüm', park,
                                         'Ar-Ge', 0, 'Örnek proje'])
                   wb.create_sheet('Özet').append(['Çalışan sayısı'])
                   path = pathlib.Path(temp) / (title + '.xlsx')
