@@ -114,7 +114,7 @@ PDF_TIPLERI = [("PDF belgesi (.pdf)", _uzanti_desenleri((".pdf",))), ("Tüm dosy
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
 # Bir kez "yeni sürümü indirdim ama hiçbir şey değişmemiş" diye vakit kaybedildi (2026-09-04).
 # Bu damga arayüzün üst şeridinde ve log'un ilk satırında görünür → hangi build olduğu belli olur.
-SURUM = "2026-10-07"
+SURUM = "2026-10-07.1"
 
 def _domain(url: str) -> str:
     return urllib.parse.urlsplit(url or "").netloc.lower()
