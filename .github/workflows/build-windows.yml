@@ -48,6 +48,10 @@ jobs:
           print('SURUM =', m.group(1) if m else 'BULUNAMADI')
         # Bu satır koşu log'una düşer → indirilen exe'nin hangi koda karşılık geldiği kayda geçer.
 
+      - name: Dijitalpark veri ve kişi mutabakatı testleri
+        working-directory: Codes
+        run: python -m unittest -q test_dijitalpark
+
       - name: Derle
         working-directory: Codes
         run: pyinstaller izin_app.spec --noconfirm
@@ -103,6 +107,62 @@ jobs:
                       assert len(data['kisiler']) == 1, data
                       assert data['kisiler'][0]['ad'] == 'ÖRNEK ' + park, data
                       print(f'PASS: {title} / {park}, dönem ve personel eşleşti')
+
+      - name: Dijitalpark DGS ve izin taslakları — derlenmiş exe
+        working-directory: Codes
+        shell: python
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          import datetime, json, pathlib, subprocess, tempfile
+          from openpyxl import Workbook
+          exe = pathlib.Path('dist/Etkin Otomasyon.exe').resolve()
+          with tempfile.TemporaryDirectory() as temp:
+              dgs = Workbook()
+              ws = dgs.active
+              ws.title = 'Page1'
+              for col, header in {'A': 'TCKimlikNo', 'D': 'Personel',
+                                  'K': 'Haftalık Çalışma Günü', 'L': 'Haftalık Çalışma Saati',
+                                  'N': 'İstisnalı Çalışılan Toplam Süre',
+                                  'O': 'Tam İstisna İçin Çalışılması Gereken Süre',
+                                  'P': 'DGS Girilecek Süre', 'R': 'Yer Alınan Proje'}.items():
+                  ws[f'{col}1'] = header
+              for col, value in {'A': '10*******18', 'D': 'ÖRNEK KİŞİ', 'K': 5, 'L': 45,
+                                 'N': '29:49', 'O': '198:00', 'P': '=O3-N3', 'R': 'Örnek proje'}.items():
+                  ws[f'{col}3'] = value
+              dgs.create_sheet('Page2').append(['Özet'])
+              dgs_path = pathlib.Path(temp) / 'dijitalpark-dgs.xlsx'
+              dgs.save(dgs_path)
+              dgs.close()
+              result = subprocess.run([str(exe), 'dgs', '--park', 'Dijitalpark', 'liste',
+                                       '--excel', str(dgs_path), '--donem', 'EYLÜL 2026'],
+                                      cwd=temp, capture_output=True, text=True, encoding='utf-8',
+                                      errors='replace', timeout=60)
+              if result.returncode:
+                  raise RuntimeError(result.stdout + result.stderr)
+              data = json.loads(result.stdout.split('<<<LISTE>>>', 1)[1])
+              assert data['park'] == 'Dijitalpark' and len(data['kisiler']) == 1, data
+              assert data['kisiler'][0]['eksik'] == '168:11', data
+
+              izin = Workbook()
+              ws = izin.active
+              ws.title = 'Tabelle1'
+              ws.append([])
+              ws.append([])
+              ws.append([])
+              ws.append([None, None, 'T.C.', 'Ad-Soyad', 'Tarih', 'Gün Sayısı'])
+              ws.append([None, None, '31**', 'ÖRNEK KİŞİ', datetime.datetime(2026, 8, 13), 1])
+              izin_path = pathlib.Path(temp) / 'dijitalpark-izin.xlsx'
+              izin.save(izin_path)
+              izin.close()
+              result = subprocess.run([str(exe), 'orchestrator', '--excel', str(izin_path),
+                                       '--parklar', 'DIJITALPARK', '--plan'], cwd=temp,
+                                      capture_output=True, text=True, encoding='utf-8',
+                                      errors='replace', timeout=60)
+              if result.returncode:
+                  raise RuntimeError(result.stdout + result.stderr)
+              assert '1 kişi' in result.stdout and 'yalnız taslak' in result.stdout, result.stdout
+              print('PASS: derlenmiş exe Dijitalpark DGS ve izin taslaklarını okudu')
 
       - uses: actions/upload-artifact@v4
         with:
