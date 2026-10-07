@@ -38,7 +38,8 @@ hiddenimports += [
 # → PyInstaller bunları göremez, tek tek bildirilmeli. Biri eksikse o park exe'de ModuleNotFoundError verir.
 hiddenimports += [
     'dgs_park',                                                       # tek giriş noktası (--park <KOD>)
-    'dgs_tpi', 'dgs_bv', 'dgs_tpiz', 'dgs_yildiz', 'dgs_ulutek',      # park scriptleri (overrides taşır)
+    'dgs_tpi', 'dgs_bv', 'dgs_tpiz', 'dgs_yildiz', 'dgs_ulutek',
+    'dgs_dijitalpark',                                                # park scriptleri (overrides taşır)
     'dgs_poc', 'dgs_onaya', 'dgs_rapor_kontrol',                      # ortak motor
 ]
 

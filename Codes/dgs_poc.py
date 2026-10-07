@@ -37,7 +37,9 @@ Kurulum / çalıştırma için README.md'ye bak.
 
 from __future__ import annotations
 import argparse
+import datetime
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -196,6 +198,10 @@ class PersonRow:
     lokasyon: str = ""
     bolum: str = ""
     tc: str = ""
+    weekly_days: int | None = None
+    weekly_hours: int | None = None
+    planned_dgs_min: int | None = None
+    manual_dgs: bool = False
 
 
 def _puantaj_sheet(wb, sheet: str):
@@ -208,34 +214,41 @@ def _puantaj_sheet(wb, sheet: str):
         "lokasyon": "Lokasyonu SGK", "ar_ge": "Ar-Ge/ Destek/ K.Dışı",
         "eksik_puantaj": "Eksik Puantaj (Saat)", "proje_adi": "Proje Adı",
     }
+    draft_headers = {
+        "tc": "TCKimlikNo", "ad_soyad": "Personel",
+        "weekly_days": "Haftalık Çalışma Günü", "weekly_hours": "Haftalık Çalışma Saati",
+        "inside_min": "İstisnalı Çalışılan Toplam Süre",
+        "full_min": "Tam İstisna İçin Çalışılması Gereken Süre",
+        "planned_dgs_min": "DGS Girilecek Süre", "proje_adi": "Yer Alınan Proje",
+    }
 
     def columns(ws):
         row = [key(v) for v in next(ws.iter_rows(max_row=1, values_only=True), ())]
-        if not all(row.count(key(h)) == 1 for h in headers.values()):
-            return None
-        return {field: row.index(key(h)) for field, h in headers.items()}
+        for style, expected in (("ortak", headers), ("dijitalpark", draft_headers)):
+            if all(row.count(key(h)) == 1 for h in expected.values()):
+                return {field: row.index(key(h)) for field, h in expected.items()}, style
+        return None
 
     preferred = [ws for ws in wb if _fold_tr(ws.title) == _fold_tr(sheet)]
     if sheet in wb.sheetnames:
         preferred = [wb[sheet]]
     if len(preferred) == 1:
-        cols = columns(preferred[0])
-        if cols is None:
-            raise ValueError(f"'{preferred[0].title}' sayfasında DGS puantaj başlıkları eksik veya yinelenmiş. "
-                             "AD SOYAD, TC Kimlik, BÖLÜM, Lokasyonu SGK, Ar-Ge/ Destek/ K.Dışı, "
-                             "Eksik Puantaj (Saat) ve Proje Adı başlıklarını kontrol edin.")
-        return preferred[0], cols
+        found = columns(preferred[0])
+        if found is None:
+            raise ValueError(f"'{preferred[0].title}' sayfasında tanınan DGS başlıkları eksik veya yinelenmiş. "
+                             "Ortak puantaj veya Dijitalpark DGS taslağının başlıklarını kontrol edin.")
+        return preferred[0], *found
 
-    candidates = [(ws, cols) for ws in wb if (cols := columns(ws)) is not None]
+    candidates = [(ws, found) for ws in wb if (found := columns(ws)) is not None]
     if len(candidates) != 1:
         if candidates:
             names = ", ".join(ws.title for ws, _ in candidates)
             raise ValueError(f"Birden fazla DGS puantaj sayfası var ({names}); "
                              f"ilgili sayfanın adını '{sheet}' yapın veya --sheet ile seçin.")
-        raise ValueError("DGS puantaj sayfası bulunamadı. İzin veya özet dosyası yerine "
-                         "AD SOYAD, TC Kimlik, Lokasyonu SGK ve Proje Adı başlıklarını içeren dosyayı seçin.")
+        raise ValueError("DGS puantaj sayfası bulunamadı. Ortak puantaj veya Dijitalpark DGS "
+                         "taslağını seçin; izin/özet dosyası DGS için kullanılamaz.")
 
-    ws, cols = candidates[0]
+    ws, found = candidates[0]
     # Başka bir ayın açıkça adlandırılmış puantajını seçilen döneme sessizce uygulama.
     import re
     months = {_fold_tr(m) for m in TR_AYLAR_TITLE.values()}
@@ -244,20 +257,95 @@ def _puantaj_sheet(wb, sheet: str):
         raise ValueError(f"Beklenen dönem sayfası '{sheet}', bulunan puantaj '{ws.title}'. "
                          "Doğru dönemin dosyasını seçin.")
     log(f"Puantaj sayfası başlıklardan bulundu: '{ws.title}' (beklenen ad: '{sheet}').")
-    return ws, cols
+    return ws, *found
 
 
-def read_excel(path: str, sheet: str = "Mayıs") -> dict[str, PersonRow]:
+def _duration_minutes(value, row_number: int, label: str) -> int:
+    """Excel [h]:mm, timedelta veya saat metnini dakika olarak oku."""
+    if isinstance(value, datetime.timedelta):
+        minutes = round(value.total_seconds() / 60)
+    elif isinstance(value, datetime.time):
+        minutes = value.hour * 60 + value.minute
+    elif isinstance(value, (int, float)):
+        minutes = round(value * 24 * 60)  # Excel süre seri değeri = gün
+    elif isinstance(value, str) and re.fullmatch(r"\d{1,4}:\d{2}", value.strip()):
+        hours, mins = map(int, value.strip().split(":"))
+        if mins >= 60:
+            raise ValueError(f"DGS satır {row_number}: {label} dakika kısmı geçersiz.")
+        minutes = hours * 60 + mins
+    else:
+        raise ValueError(f"DGS satır {row_number}: {label} süre olarak okunamadı.")
+    if minutes < 0:
+        raise ValueError(f"DGS satır {row_number}: {label} negatif olamaz.")
+    return minutes
+
+
+def read_excel(path: str, sheet: str = "Mayıs", park_code: str | None = None) -> dict[str, PersonRow]:
     """Puantajı doğrulanmış başlıklardan oku; dosyayı ve dönem/resume anahtarını değiştirme."""
     wb = load_workbook(path, data_only=True, read_only=True)
     out: dict[str, PersonRow] = {}
+    seen_name_fold: set[str] = set()
     try:
-        ws, cols = _puantaj_sheet(wb, sheet)
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            values = {field: str(row[i]).strip() if i < len(row) and row[i] is not None else ""
-                      for field, i in cols.items()}
-            if values["ad_soyad"]:
-                out[values["ad_soyad"].upper()] = PersonRow(**values)
+        ws, cols, style = _puantaj_sheet(wb, sheet)
+        if style == "dijitalpark" and park_code != "Dijitalpark":
+            raise ValueError("Dijitalpark DGS taslağı yalnız Dijitalpark parkı seçilince kullanılabilir.")
+        formulas = load_workbook(path, data_only=False, read_only=True) if style == "dijitalpark" else None
+        try:
+            formula_ws = formulas[ws.title] if formulas else None
+            seen_tc: set[str] = set()
+            for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                raw = {field: row[i] if i < len(row) else None for field, i in cols.items()}
+                name = str(raw["ad_soyad"] or "").strip()
+                if not name:
+                    continue
+                if style == "ortak":
+                    values = {field: str(value).strip() if value is not None else ""
+                              for field, value in raw.items()}
+                    person = PersonRow(**values)
+                    if not (person.tc.isdigit() and len(person.tc) == 11):
+                        raise ValueError(f"DGS satır {row_number}: T.C. 11 rakam olmalı.")
+                else:
+                    tc = str(raw["tc"] or "").strip()
+                    if not ((tc.isdigit() and len(tc) == 11)
+                            or re.fullmatch(r"\d{2}\*{7}\d{2}", tc)):
+                        raise ValueError(f"DGS satır {row_number}: T.C. 11 rakam veya 2+7 yıldız+2 maske olmalı.")
+                    try:
+                        days = int(raw["weekly_days"])
+                        hours = int(raw["weekly_hours"])
+                    except (TypeError, ValueError):
+                        raise ValueError(f"DGS satır {row_number}: K/L haftalık gün ve saat tam sayı olmalı.") from None
+                    inside = _duration_minutes(raw["inside_min"], row_number, "N")
+                    full = _duration_minutes(raw["full_min"], row_number, "O")
+                    if full < inside:
+                        raise ValueError(f"DGS satır {row_number}: O sütunu N'den küçük.")
+                    planned = raw["planned_dgs_min"]
+                    if planned is None and formula_ws is not None:
+                        formula = formula_ws.cell(row_number, cols["planned_dgs_min"] + 1).value
+                        if str(formula).replace("$", "").upper() == f"=O{row_number}-N{row_number}":
+                            planned = full - inside
+                    else:
+                        planned = _duration_minutes(planned, row_number, "P")
+                    if planned is None:
+                        raise ValueError(f"DGS satır {row_number}: P formül sonucu boş; sabit süre girin.")
+                    if planned > full - inside:
+                        raise ValueError(f"DGS satır {row_number}: P tam teşvik eksiğini aşıyor.")
+                    person = PersonRow(name, str(raw["proje_adi"] or "").strip(), to_hhmm(planned),
+                                       "Ar-Ge", park_code, "", tc, days, hours, planned,
+                                       planned < full - inside)
+                    if not person.proje_adi:
+                        raise ValueError(f"DGS satır {row_number}: proje adı boş.")
+                key = name.upper()
+                name_fold = _fold_tr(name)
+                if key in out or name_fold in seen_name_fold or (person.tc and person.tc.isdigit() and person.tc in seen_tc):
+                    raise ValueError(f"DGS satır {row_number}: aynı personel adı veya T.C. ikinci kez var. "
+                                     "Kişi sessizce atlanmasın diye dosya durduruldu.")
+                out[key] = person
+                seen_name_fold.add(name_fold)
+                if person.tc and person.tc.isdigit():
+                    seen_tc.add(person.tc)
+        finally:
+            if formulas:
+                formulas.close()
         if not out:
             raise ValueError(f"'{ws.title}' puantaj sayfasında personel bulunamadı.")
         log(f"Excel okundu: {len(out)} personel ({ws.title})")
@@ -270,14 +358,17 @@ def is_ar_ge(p: PersonRow) -> bool:
     return "arge" in (p.ar_ge or "").lower().replace("-", "")
 
 
-def person_schedule(name: str, sched_map: dict) -> tuple[int, bool]:
+def person_schedule(person: PersonRow, sched_map: dict) -> tuple[int, bool]:
     """Kişinin (günlük_hedef_dk, cumartesi_dahil_mi)'sini döndürür. Standart dışıysa VerifyError (DUR).
       5 gün / 45 saat → (540, False)  [CANLI TEST EDİLDİ — 9:00/gün, hafta içi]
       6 gün / 45 saat → (450, True)   [allow_6day=True gerektirir; CANLI TEST EDİLMEDİ]
     Harita kişiyi içermiyorsa veya program standart dışıysa DURUR (yanlış varsayım yerine).
     NOT: günlük hedef ayrıca grid'in temiz-gün varsayılanıyla çapraz kontrol edilir (process_one_person)."""
+    name = person.ad_soyad
     key = name.strip().upper()
-    if key not in sched_map:
+    if person.weekly_days is not None and person.weekly_hours is not None:
+        gun, saat = person.weekly_days, person.weekly_hours
+    elif key not in sched_map:
         # Diakritik/boşluk toleranslı eşleşme (İ↔I, Ç↔C, Ö↔O ...): ASCII-fold edip karşılaştır.
         # SADECE tek bir aday varsa kullan (belirsizse DUR — yanlış kişiyi seçme).
         import unicodedata
@@ -301,7 +392,8 @@ def person_schedule(name: str, sched_map: dict) -> tuple[int, bool]:
                 return CONFIG["daily_target_min"], False
             extra = " (BİRDEN FAZLA fold-eşleşme, belirsiz)" if len(cands) > 1 else ""
             raise VerifyError(f"{name}: Personel Listesi haritasında program bulunamadı (isim eşleşmedi){extra}.{hint} MANUEL.")
-    gun, saat = sched_map[key]
+    if person.weekly_days is None or person.weekly_hours is None:
+        gun, saat = sched_map[key]
     if gun <= 0 or (saat * 60) % gun != 0:
         raise VerifyError(f"{name}: {saat} saat / {gun} gün tam bölünmüyor — MANUEL.")
     daily = saat * 60 // gun
@@ -679,9 +771,12 @@ _DGS_PICK_LI_BY_TC_JS = (r"""(args) => {const [tcArg, toks] = args;
       const cand=lis.map(li=>{const raw=li.textContent||''; const m=raw.match(/(\d{2})\*+(\d{2})/);
         const nm=_fold(raw.replace(/\s+[\d\*]{3,}.*$/,''));
         return {li, text: raw.trim(), tcM:(tcArg && m && m[1]===f2 && m[2]===l2), ov:toks.filter(t=>nm.includes(t)).length};});
-      let pick = tcArg ? cand.filter(c=>c.tcM) : cand.filter(c=>c.ov===toks.length);
+      const byTc=cand.filter(c=>c.tcM);
+      const exact=byTc.filter(c=>c.ov===toks.length);
+      let pick = tcArg ? (exact.length===1 ? exact : byTc.length===1 ? byTc : [])
+                       : cand.filter(c=>c.ov===toks.length);
       pick.sort((a,b)=>b.ov-a.ov);
-      if(!pick.length) return JSON.stringify({ok:false, reason:(tcArg?'tc-maske eşleşmedi':'ad eşleşmedi')});
+      if(pick.length!==1) return JSON.stringify({ok:false, reason:(tcArg?'tc-maske eşleşmedi veya belirsiz':'ad eşleşmedi veya belirsiz')});
       const best=pick[0];
       if(tcArg && best.ov===0) return JSON.stringify({ok:false, reason:'T.C. eşleşti ama isim HİÇ tutmuyor (güvenlik dur)'});
       const tgt=best.li.querySelector('a,div')||best.li;
@@ -705,7 +800,7 @@ def select_personel(page: Page, ad_soyad: str, tc: str | None = None):
     intended = _fold_tr(ad_soyad)
     tokens = intended.split()
     tcs = str(tc).strip() if tc else ""
-    use_tc = tcs.isdigit() and len(tcs) == 11
+    use_tc = (tcs.isdigit() and len(tcs) == 11) or bool(re.fullmatch(r"\d{2}\*{7}\d{2}", tcs))
     tc_arg = tcs if use_tc else ""
     parts = ad_soyad.split()
     cands = [ad_soyad]
@@ -1319,10 +1414,13 @@ def onaya_gonder_in_form(page) -> str:
 def process_one_person(page: Page, person: PersonRow, first: bool, sched_map: dict) -> dict:
     """Tek kişiyi uçtan uca. TÜM kontroller geçmeden Kaydet YOK. Hata → kaydedilmez, FAILED döner."""
     if not is_ar_ge(person) and not CONFIG.get("include_destek"):
-        return {"ad": person.ad_soyad, "ok": True, "mesaj": f"ATLANDI (tür={person.ar_ge}, Ar-Ge değil)"}
+        raise VerifyError(f"{person.ad_soyad}: Ar-Ge dışı personel için 'Destek' seçeneği gerekir.")
+    if person.manual_dgs:
+        raise VerifyError(f"{person.ad_soyad}: Excel P sütunu tam teşvik süresinden kısılmış. "
+                          "Otomatik tam süre girişi yerine manuel işleyin.")
 
     # kişi-bazında haftalık program → günlük hedef + cumartesi. Standart dışıysa BURADA DURUR (yanlış girmez).
-    daily_target, include_sat = person_schedule(person.ad_soyad, sched_map)
+    daily_target, include_sat = person_schedule(person, sched_map)
 
     if first:
         open_dgs_form(page)
@@ -1407,6 +1505,9 @@ def process_one_person(page: Page, person: PersonRow, first: bool, sched_map: di
         r"""() => {const c=document.querySelector('.BuFordaIstenilen'); const i=c?c.querySelector('input'):null; return i?i.value.trim():'?';}""")
     if istenilen != "?" and to_min(istenilen) != expected:
         raise VerifyError(f"İstenilen toplam uyuşmuyor: portal={istenilen} hesap={to_hhmm(expected)}")
+    if person.planned_dgs_min is not None and expected != person.planned_dgs_min:
+        raise VerifyError(f"Excel P={to_hhmm(person.planned_dgs_min)}, portalda hesaplanan DGS="
+                          f"{to_hhmm(expected)}. Yanlış süre kaydedilmesin diye durdu.")
     log(f"  KONTROL: tikli={len(ticked)} | İstenilen={istenilen} (beklenen {to_hhmm(expected)}) ✓")
 
     msg = save_draft(page)
@@ -1452,6 +1553,8 @@ def main():
                          "geliyor zaten). Herkes assume-std 540; grid temiz-gün çapraz-kontrolü (==09:00) "
                          "6-günlüğü/anomaliyi yakalar. --assume-std'yi otomatik açar. İlk kişide --limit 1 ile doğrula.")
     args = ap.parse_args()
+    if args.limit < 0:
+        ap.error("--limit negatif olamaz")
     CONFIG["dry_run"] = not args.commit
     CONFIG["assume_standard"] = args.assume_std or args.no_schedule
     CONFIG["include_destek"] = args.include_destek
@@ -1464,26 +1567,32 @@ def main():
     log(f"Dönem: {donem_label} (ay_regex={ay_regex}, sheet='{sheet}')")
 
     try:
-        allp = read_excel(args.excel, sheet)
+        allp = read_excel(args.excel, sheet, args.lokasyon)
     except Exception as e:
         log(f"EXCEL HATASI: {e}")
         sys.exit(2)
+    park_people = [p for p in allp.values() if p.lokasyon.upper() == args.lokasyon.upper()]
     if args.person:
         key = args.person.upper()
         if key not in allp:
-            log(f"HATA: '{args.person}' yok. Örnek: {list(allp)[:5]}"); sys.exit(1)
+            log("HATA: seçilen personel Excel'de yok."); sys.exit(1)
         targets = [allp[key]]
     elif args.file:
         names = [l.strip() for l in open(args.file, encoding="utf-8") if l.strip()]
-        targets = []
-        for nm in names:
-            k = nm.upper()
-            if k in allp:
-                targets.append(allp[k])
-            else:
-                log(f"  UYARI: '{nm}' Excel'de yok, atlandı.")
+        missing = [nm for nm in names if nm.upper() not in allp]
+        if missing or len(set(nm.upper() for nm in names)) != len(names):
+            log(f"HATA: kişi listesinde {len(missing)} bulunamayan ad veya tekrar var; "
+                "hiçbir kayıt açılmadı.")
+            sys.exit(2)
+        targets = [allp[nm.upper()] for nm in names]
     else:
-        targets = [p for p in allp.values() if p.lokasyon.upper() == args.lokasyon.upper() and is_ar_ge(p)]
+        targets = [p for p in park_people if is_ar_ge(p) or args.include_destek]
+        excluded = len(park_people) - len(targets)
+        log(f"ÖN KONTROL: seçili park Excel'de {len(park_people)} kişi; hedef {len(targets)}; "
+            f"Ar-Ge dışı ve seçenek kapalı olduğu için hariç {excluded}.")
+    if any(p.lokasyon.upper() != args.lokasyon.upper() for p in targets):
+        log("HATA: seçilen kişi/listede başka park çalışanı var; hiçbir kayıt açılmadı.")
+        sys.exit(2)
     bypass_done = bool(args.person or args.file)   # --person/--file: done-skip ATLA (yeniden-girme için)
     if args.limit:
         targets = targets[: args.limit]
@@ -1497,6 +1606,7 @@ def main():
         log(f"{len(done)} kişi zaten işlenmiş (atlanacak).")
 
     results = []
+    done_skipped = 0
     with sync_playwright() as pw:
         browser, page = attach_browser(pw)
         if CONFIG.get("auto_onay"):
@@ -1519,8 +1629,10 @@ def main():
                     log(f"    [{k}] = {sched_map[k]}")
                 return
             first = True
+            interrupted = False
             for i, person in enumerate(targets, 1):
                 if person.ad_soyad in done and not bypass_done:
+                    done_skipped += 1
                     continue
                 log(f"\n=== [{i}/{len(targets)}] {person.ad_soyad} (proje: {person.proje_adi[:35]}) ===")
                 try:
@@ -1530,6 +1642,7 @@ def main():
                 except CloudflareHalt as e:
                     log(f"!! DURDU (Cloudflare/oturum): {e}")
                     log("   Elle Cloudflare'i geç + dashboard'a dön, sonra tekrar koş (resume devam eder).")
+                    interrupted = True
                     break
                 except VerifyError as e:
                     ts = int(time.time()); shot = f"dgs_verify_{ts}.png"
@@ -1556,10 +1669,15 @@ def main():
                             f.write(person.ad_soyad + "\n")
 
             ok = sum(1 for r in results if r["ok"])
-            log(f"\n==== ÖZET: {ok}/{len(results)} sorunsuz ====")
+            failed = len(results) - ok
+            pending = len(targets) - done_skipped - len(results)
+            log(f"\n==== MUTABAKAT: hedef {len(targets)} = önceden girilmiş {done_skipped} + "
+                f"bu koşuda başarılı {ok} + başarısız {failed} + bekleyen {pending} ====")
             for r in results:
                 if not r["ok"]:
                     log(f"  !! BAŞARISIZ: {r['ad']} — {r['mesaj']}")
+            if interrupted or pending:
+                log(f"  !! EKSİK: {pending} kişi işlenmeden koşu durdu.")
             if CONFIG.get("auto_onay"):
                 onaylanan = sum(1 for r in results if r.get("onaylandi"))
                 log(f"HATIRLATMA: --onayla açıktı → {onaylanan}/{len(results)} kişi TASLAK+ONAYA GÖNDERİLDİ. "
@@ -1571,8 +1689,11 @@ def main():
                 input(f"{LOG} >> Bitti. ENTER ile kapat...")
             except EOFError:
                 pass
+            if failed or pending or interrupted:
+                sys.exit(1)
         except CloudflareHalt as e:
             log(f"GENEL DURUŞ (Cloudflare/oturum): {e}")
+            sys.exit(1)
         except Exception as e:
             log(f"GENEL HATA: {e}")
             raise

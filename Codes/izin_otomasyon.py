@@ -201,7 +201,7 @@ def _shot(page, prefix):
 
 def reconcile(work, results, park: Park) -> dict:
     """MUTABAKAT: her hedef kişi bir sonuç kovasına düşmeli. 'Kayıp' (hiç sonuç üretmeyen) = ALARM."""
-    by_tc = {r["tc"]: r for r in results}
+    by_person = {(r["tc"], fold(r["ad"])): r for r in results}
     girildi = [r for r in results if r["durum"] == "girildi"]
     dry = [r for r in results if r["durum"] == "dry_girilecek"]
     zaten = [r for r in results if r["durum"] == "zaten_girili"]
@@ -209,7 +209,7 @@ def reconcile(work, results, park: Park) -> dict:
     flag = [r for r in results if r["durum"] == "FLAG"]
     basarisiz = [r for r in results if r["durum"] == "BAŞARISIZ"]
     halt = [r for r in results if r["durum"] == "halt"]
-    kayip = [p for p in work if p.tc not in by_tc]       # sonucu OLMAYAN hedef = sessiz atlama adayı
+    kayip = [p for p in work if (p.tc, fold(p.ad)) not in by_person]
     flagli = [r for r in results if r.get("flag")]       # kovadan bağımsız, flag'i olan herkes (uyarı için)
     return {
         "park": park.code, "beklenen": len(work),
@@ -350,8 +350,9 @@ def run_approval_pdfli(park: Park, meta: dict, people, belge_klasor: str | None,
 # Plan modu (portalsız ön-uçuş — offline test edilebilir)
 # ---------------------------------------------------------------------------
 def run_plan(excel: str, parklar, belge_klasor: str | None, detay: bool = True,
-             ortak_belge: str | None = None):
-    by_park, meta = data.read_izin_v2(excel, strict=True)
+             ortak_belge: str | None = None, default_park: str | None = None):
+    by_park, meta = data.read_izin_v2(excel, strict=True,
+                                     default_park=default_park or (parklar[0].code if parklar and len(parklar) == 1 else None))
     print("=" * 74)
     print(f"ÖN-UÇUŞ PLANI — {os.path.basename(os.path.expanduser(excel))}")
     print(f"Dönem: {meta['donem_label']} | done-dosya eki: _{meta['ay_key']}.txt")
@@ -365,7 +366,9 @@ def run_plan(excel: str, parklar, belge_klasor: str | None, detay: bool = True,
     for code in order:
         pk = PARKS[code]
         people = by_park[code]
-        if pk.onay_pdf:
+        if not pk.onay_dogrulandi:
+            pdf = "  [ONAY: doğrulanmadı, yalnız taslak]"
+        elif pk.onay_pdf:
             folder = izin_belge.find_belge_klasor(pk, base=belge_klasor)
             rd = izin_belge.readiness(people, folder, mode=pk.onay_pdf, ortak_belge=ortak_belge)
             hazir = rd["eslesen"] == rd["toplam"] and not rd["nonpdf"]
@@ -418,6 +421,8 @@ def main():
     ap.add_argument("--cdp", default=None, help="CDP adresi (ör. http://localhost:9223); yoksa DGS_CDP/9222")
     ap.add_argument("--plan", action="store_true", help="Portalsız ön-uçuş planı (hiçbir şeye dokunmaz)")
     args = ap.parse_args()
+    if args.limit < 0:
+        ap.error("--limit negatif olamaz")
 
     excel = os.path.expanduser(args.excel)
     if not os.path.exists(excel):
@@ -429,14 +434,17 @@ def main():
 
     # --- Veri: bozuksa BURADA durur (portala dokunmadan) ---
     try:
-        by_park, meta = data.read_izin_v2(excel, strict=True)
+        by_park, meta = data.read_izin_v2(excel, strict=True,
+                                         default_park=(parklar[0].code if parklar and len(parklar) == 1
+                                                       else args.park))
     except data.DataError as e:
         log(f"❌ VERİ HATASI — portala dokunulmadı:\n{e}"); sys.exit(2)
     log(f"Veri OK: {meta['toplam_kisi']} kişi, dönem {meta['donem_label']}. Otomasyon parkları: "
         f"{', '.join(c for c in by_park if PARKS[c].otomasyon)}")
 
     if args.plan:
-        run_plan(excel, parklar, args.belge_klasor, ortak_belge=args.ortak_belge)
+        run_plan(excel, parklar, args.belge_klasor, ortak_belge=args.ortak_belge,
+                 default_park=args.park)
         return
 
     # --- Canlı: Playwright motorunu şimdi import et (plan modunda gereksiz) ---
@@ -469,6 +477,10 @@ def main():
                 f"Ya listeye ekle ya da seçili bir parkın portalına geç — DURDU (yanlışlıkla işlem yok)."); sys.exit(3)
         if not active.otomasyon:
             log(f"HATA: {active.code} Teknoera (excel upload) — Playwright kapsamı dışı."); sys.exit(1)
+        if args.onayla and not active.onay_dogrulandi:
+            log(f"HATA: {active.code} izin onayı ve belge kuralı doğrulanmadı. "
+                "Taslak giriş için 'Onaya gönder' seçimini kapatın; portala dokunulmadı.")
+            sys.exit(2)
 
         targets = by_park.get(active.code, [])
         if not targets:
@@ -501,6 +513,8 @@ def main():
         input(f"{LOG} >> Bitti. ENTER ile kapat...")
     except EOFError:
         pass
+    if recon and (recon["basarisiz"] or recon["halt"] or recon["kayip"]):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ PARKS: dict[str, Park] = {
     "TPIz": Park("TPIz", "Teknopark İzmir", "https://argeportal.teknoparkizmir.com.tr/"),
     "Yıldız": Park("Yıldız", "Yıldız Teknopark (Davutpaşa)", "https://argeportal.yildizteknopark.com.tr/"),
     "Ulutek": Park("Ulutek", "Ulutek Teknopark (Bursa)", "https://argeportal.ulutek.com.tr/"),
+    "Dijitalpark": Park("Dijitalpark", "Dijitalpark Teknokent", "https://argeportal.dijitalparkteknokent.com.tr/"),
 }
 
 MODLAR = ("giris", "onay", "kontrol", "liste", "kapanis")
@@ -243,8 +244,8 @@ def _istisna_uygula(D, mod: str, istisna):
     if mod == "giris":
         orijinal = D.read_excel
 
-        def read_excel_istisnasiz(path, sheet="Mayıs"):
-            allp = orijinal(path, sheet)
+        def read_excel_istisnasiz(path, sheet="Mayıs", park_code=None):
+            allp = orijinal(path, sheet, park_code)
             atlanan = [k for k, p in allp.items() if istisna_mi(p.tc, p.ad_soyad)]
             for k in atlanan:
                 print(f"[İSTİSNA] ATLANDI: {allp[k].ad_soyad}", flush=True)
@@ -279,7 +280,7 @@ def _liste(D, park: Park, excel: str | None, sheet: str):
     """
     if not excel:
         _hata("liste modu --excel ister.")
-    allp = D.read_excel(excel, sheet)
+    allp = D.read_excel(excel, sheet, park.code)
     done_file = f"dgs_done_{park.code}_{sheet}.txt"          # cwd'ye göre (GUI cwd=data_dir verir)
     done = set()
     if os.path.exists(done_file):
@@ -322,7 +323,7 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
         print("[KAPANIŞ] EXCEL HATASI: DGS puantaj dosyası seçilmedi. Tekrar giriş başlatılmadı.", flush=True)
         sys.exit(2)
     try:
-        allp = D.read_excel(os.path.expanduser(xl), sheet)
+        allp = D.read_excel(os.path.expanduser(xl), sheet, park.code)
         fold_map = {D._fold_tr(k): k for k in allp
                     if allp[k].lokasyon.upper() == park.code.upper()}
         if not fold_map:
@@ -460,6 +461,7 @@ PARK_MODULLERI = {
     "TPIz": "dgs_tpiz",
     "Yıldız": "dgs_yildiz",
     "Ulutek": "dgs_ulutek",
+    "Dijitalpark": "dgs_dijitalpark",
 }
 
 _KULLANIM = (

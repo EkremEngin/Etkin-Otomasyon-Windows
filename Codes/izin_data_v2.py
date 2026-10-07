@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import re
 import sys
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ class Park:
     onay_pdf: str      # onaya-gönder dosya gereksinimi: "" (PDF'siz) | "per_person" (kişi-başı belge)
                        #   | "ortak" (park için TEK toplu belge; aynı PDF herkesin kaydına yüklenir)
     evrak_tipi: str = ""   # PDF'li parkta yükleme "Evrak Tipi" radyo ETİKETİ (park-bazlı; value HARDCODE ETME)
+    onay_dogrulandi: bool = True  # False: yalnız taslak izin girişi
 
 
 PARKS: "OrderedDict[str, Park]" = OrderedDict([
@@ -71,6 +73,7 @@ PARKS: "OrderedDict[str, Park]" = OrderedDict([
     ("İYTE",   Park("İYTE",   "Teknopark İzmir",             "https://argeportal.teknoparkizmir.com.tr/",    "TPIz",   True,  "ortak",      "yıllık izin formu")),
     ("YTP",    Park("YTP",    "Davutpaşa Yıldız Teknopark",  "https://argeportal.yildizteknopark.com.tr/",   "Yıldız", True,  "per_person", "Ücretli Yıllık İzin Formu")),
     ("ULUTEK", Park("ULUTEK", "Bursa Ulutek Teknopark",      "https://argeportal.ulutek.com.tr/",            "Ulutek", True,  "per_person", "Yıllık İzin Dilekçesi")),
+    ("DIJITALPARK", Park("DIJITALPARK", "Dijitalpark Teknokent", "https://argeportal.dijitalparkteknokent.com.tr/", "Dijitalpark", True, "", onay_dogrulandi=False)),
     ("ARI",    Park("ARI",    "ARI Teknokent",               "https://portal.ariteknokent.com.tr/",          "Arı",    False, "")),
     ("ODTÜ",   Park("ODTÜ",   "ODTÜ Teknokent",              "https://portal.odtuteknokent.com.tr/",         "ODTÜ",   False, "")),
 ])
@@ -81,6 +84,7 @@ _PARK_ALIAS = {
     "yildiz": "YTP", "ytp": "YTP", "davutpasa": "YTP",
     "ari": "ARI", "odtu": "ODTÜ",
     "tpi": "TPI", "bv": "BV", "bilisimvadisi": "BV", "ulutek": "ULUTEK",
+    "dijitalpark": "DIJITALPARK", "dijital park": "DIJITALPARK",
 }
 
 
@@ -188,9 +192,11 @@ def _find_header(rows) -> tuple[int, dict]:
             for j, c in enumerate(r):
                 if isinstance(c, str) and fold(c) in ("tgb", "park", "lokasyon", "tgb kodu"):
                     ci["park"] = j
+                    ci["park_explicit"] = True
                     break
             if "park" not in ci:                          # başlıkta yoksa gün'den bir sonraki kolonu varsay
                 ci["park"] = ci["gun"] + 1
+                ci["park_explicit"] = False
             return i, ci
     raise DataError("Başlık satırı bulunamadı ('T.C.' + 'Ad-Soyad' + 'Tarih' + 'Gün Sayısı' aranıyor). "
                     "Beklenen format: sütunlarda T.C., Ad-Soyad, Tarih, Gün Sayısı, TGB.")
@@ -222,7 +228,8 @@ def _norm_date(v):
     return s, None
 
 
-def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True):
+def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True,
+                 default_park: str | None = None):
     """
     Yeni tek-dosya izin formatını oku + doğrula + parka göre grupla.
 
@@ -239,6 +246,11 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True):
     ws = wb[sh]
     rows = list(ws.iter_rows(values_only=True))
     hdr_i, ci = _find_header(rows)
+    if not ci["park_explicit"]:
+        park = resolve_park(default_park)
+        if park is None:
+            raise DataError("İzin Excel'inde TGB sütunu yok. Tek park seçin veya TGB sütunu ekleyin.")
+        default_park = park.code
 
     # 1) satırları çöz + ay/yıl histogramı (dönem tespiti)
     raw = []                                              # (rownum, tc, ad, date_str, dt, gun, park_code)
@@ -252,7 +264,10 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True):
             continue                                      # boş satır
         date_str, dt = _norm_date(cell("date"))
         gun = cell("gun")
-        park_raw = cell("park")
+        park_raw = cell("park") if ci["park_explicit"] else default_park
+        if not ci["park_explicit"] and cell("park") not in (None, ""):
+            raise DataError(f"satır {n}: TGB başlığı yok ama sonraki sütunda değer var. "
+                            "Parkı yanlış varsaymamak için TGB başlığı ekleyin.")
         raw.append((n, cell("tc"), str(ad).strip(), date_str, dt, gun,
                     (str(park_raw).strip() if park_raw is not None else "")))
         if dt:
@@ -268,18 +283,23 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True):
 
     # 2) satır doğrulama
     errors = []
-    people: "OrderedDict[str, IzinPersonV2]" = OrderedDict()   # tc -> person
+    people: "OrderedDict[str, IzinPersonV2]" = OrderedDict()   # tam TC veya maske + ad -> person
     name_by_tc = {}
     for (n, tc, ad, date_str, dt, gun, park_raw) in raw:
         tcs = str(tc).strip() if tc is not None else ""
         # T.C.
-        if not tc_valid(tcs):
-            errors.append(f"  satır {n}: geçersiz T.C. {tcs!r} (kişi: {ad}) — 11 hane + checksum tutmuyor")
+        full_tc = tc_valid(tcs)
+        partial_tc = bool(re.fullmatch(r"\d{2}\*+", tcs)) and not ci["park_explicit"]
+        if not full_tc and not partial_tc:
+            errors.append(f"  satır {n}: geçersiz T.C. maskesi/numarası (kişi: {ad}) — "
+                          "tam 11 hane veya tek park taslağında ilk 2 hane + yıldız gerekli")
             continue
+        person_key = tcs if full_tc else f"{tcs}|{fold(ad)}"
         # kimlik tutarlılığı (aynı TC farklı isim yazımı → uyar ama durdurma; ilk yazımı kullan)
-        if tcs in name_by_tc and fold(name_by_tc[tcs]) != fold(ad):
+        if full_tc and tcs in name_by_tc and fold(name_by_tc[tcs]) != fold(ad):
             errors.append(f"  satır {n}: T.C. {tcs} iki farklı isimle: {name_by_tc[tcs]!r} / {ad!r}")
-        name_by_tc.setdefault(tcs, ad)
+        if full_tc:
+            name_by_tc.setdefault(tcs, ad)
         # park
         park = resolve_park(park_raw)
         if park is None:
@@ -303,10 +323,10 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True):
             errors.append(f"  satır {n}: tarih {date_str} dönem ({donem_label}) dışında (kişi: {ad})")
             continue
         # birik
-        p = people.get(tcs)
+        p = people.get(person_key)
         if p is None:
             p = IzinPersonV2(tc=tcs, ad=ad, park_code=park.code)
-            people[tcs] = p
+            people[person_key] = p
         elif p.park_code != park.code:
             errors.append(f"  satır {n}: {ad} (T.C. {tcs}) iki farklı parkta: {p.park_code} / {park.code}")
         p.gunler.append((date_str, g))
@@ -345,7 +365,7 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True):
 def build_targets(path: str, park: str | None = None, only_otomasyon: bool = True,
                   strict: bool = True):
     """Tek park (veya tümü) için hedef liste. park=None → tüm otomasyon parkları düz liste + by_park."""
-    by_park, meta = read_izin_v2(path, strict=strict)
+    by_park, meta = read_izin_v2(path, strict=strict, default_park=park)
     if park:
         pk = resolve_park(park)
         if pk is None:
@@ -360,7 +380,7 @@ def build_targets(path: str, park: str | None = None, only_otomasyon: bool = Tru
 # ---------------------------------------------------------------------------
 def _report(path: str, park: str | None):
     try:
-        by_park, meta = read_izin_v2(path, strict=True)
+        by_park, meta = read_izin_v2(path, strict=True, default_park=park)
     except DataError as e:
         print(f"\n❌ VERİ HATASI — durduruldu:\n{e}\n", file=sys.stderr)
         sys.exit(2)
@@ -394,12 +414,12 @@ def _report(path: str, park: str | None):
     print(f"Doğrulama: T.C.✓  gün(1/0,5)✓  tarih({meta['donem_label']})✓  park-kodu✓  → 0 SESSİZ ATLAMA")
     print("=" * 78)
     if not park:
-        print("Tek park detayı için: --park TPI  (veya BV/İYTE/YTP/ULUTEK)")
+        print("Tek park detayı için: --park TPI  (veya BV/İYTE/YTP/ULUTEK/DIJITALPARK)")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="İzin veri katmanı v2 — portalsız doğrulama raporu")
     ap.add_argument("excel", help="İzin Excel yolu (ör. ~/Downloads/Haziran 2026 Yıllık İzinler.xlsx)")
-    ap.add_argument("--park", default=None, help="Tek park detayını dök (TPI/BV/İYTE/YTP/ULUTEK)")
+    ap.add_argument("--park", default=None, help="Tek park detayını dök (TPI/BV/İYTE/YTP/ULUTEK/DIJITALPARK)")
     args = ap.parse_args()
     _report(args.excel, args.park)

@@ -113,7 +113,7 @@ PDF_TIPLERI = [("PDF belgesi (.pdf)", _uzanti_desenleri((".pdf",))), ("Tüm dosy
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
 # Bir kez "yeni sürümü indirdim ama hiçbir şey değişmemiş" diye vakit kaybedildi (2026-09-04).
 # Bu damga arayüzün üst şeridinde ve log'un ilk satırında görünür → hangi build olduğu belli olur.
-SURUM = "2026-09-21"
+SURUM = "2026-10-07"
 
 def _domain(url: str) -> str:
     return urllib.parse.urlsplit(url or "").netloc.lower()
@@ -132,6 +132,7 @@ PARK_DISPLAY = {
     "argeportal.teknoparkizmir.com.tr":    "Teknopark İzmir",
     "argeportal.yildizteknopark.com.tr":   "Yıldız Teknopark",
     "argeportal.ulutek.com.tr":            "Ulutek Teknopark",
+    "argeportal.dijitalparkteknokent.com.tr": "Dijitalpark Teknokent",
 }
 
 
@@ -830,9 +831,11 @@ class IzinGUI:
         ctk.CTkCheckBox(adv5, text="Gerçek kayıt (commit)", variable=self.commit, corner_radius=8,
                          border_color=UI["primary"], fg_color=UI["primary"], hover_color=UI["primary_hover"],
                          text_color=UI["text"], font=("Helvetica", 10)).pack(side="left", padx=12, pady=9)
-        ctk.CTkCheckBox(adv5, text="Onaya gönder", variable=self.onayla, corner_radius=8,
-                         border_color=UI["primary"], fg_color=UI["primary"], hover_color=UI["primary_hover"],
-                         text_color=UI["text"], font=("Helvetica", 10)).pack(side="left", padx=8, pady=9)
+        self.onay_chk = ctk.CTkCheckBox(adv5, text="Onaya gönder", variable=self.onayla, corner_radius=8,
+                                        border_color=UI["primary"], fg_color=UI["primary"],
+                                        hover_color=UI["primary_hover"], text_color=UI["text"],
+                                        font=("Helvetica", 10))
+        self.onay_chk.pack(side="left", padx=8, pady=9)
         self._run_btns += [self.preflight_btn, self.start_btn]
         self._stop_btns.append(self.stop_btn)
 
@@ -1207,14 +1210,25 @@ class IzinGUI:
 
     def _on_park_change(self):
         p = self._cur_park()
+        if not p.onay_dogrulandi:
+            self.onayla.set(False)
+        self.onay_chk.configure(state="normal" if p.onay_dogrulandi else "disabled")
         short, desc = MODE_TR.get(p.onay_pdf, ("?", ""))
-        self.mode_lbl.configure(text=f"MOD: {short.upper()}")
+        self.mode_lbl.configure(text="MOD: TASLAK" if not p.onay_dogrulandi else f"MOD: {short.upper()}")
         # --- YEDEK: text=f"{p.code} PORTALI"  (chip'te de ortak ad; sekmeler arası kod farkı görünmesin)
         self.park_chip.configure(text=f"{park_display(p)} PORTALI")
         extra = f"  ·  Evrak tipi: “{p.evrak_tipi}”" if p.evrak_tipi else ""
-        self.mode_desc.configure(text=f"{p.ad}  ·  {p.portal_url}\n{desc}{extra}")
+        self.mode_desc.configure(text=(f"{p.ad}  ·  {p.portal_url}\n"
+                                       "İzin onayı ve belge kuralı doğrulanmadı; yalnız taslak giriş."
+                                       if not p.onay_dogrulandi else f"{p.ad}  ·  {p.portal_url}\n{desc}{extra}"))
         # belge bölümü modu
-        if p.onay_pdf == "":
+        if not p.onay_dogrulandi:
+            self.belge_btn.configure(state="disabled")
+            self.belge_info_btn.configure(state="disabled")
+            self.belge_entry.configure(state="disabled")
+            self.belge_lbl.configure(text="Onay ve belge kuralı doğrulanana kadar yalnız taslak kaydedilir.",
+                                     text_color=UI["warning"])
+        elif p.onay_pdf == "":
             self.belge_btn.configure(state="disabled")
             self.belge_info_btn.configure(state="disabled")
             self.belge_entry.configure(state="disabled")
@@ -1575,11 +1589,13 @@ class IzinGUI:
             "──────────────────────────\n"
             "Firma tek bir Excel yollar. Başlık satırı otomatik bulunur; şu KOLONLAR olmalı\n"
             "(başlık isimleri şöyle geçmeli):\n\n"
-            "   • T.C.        → 11 haneli T.C. kimlik no (checksum doğrulanır)\n"
+            "   • T.C.        → 11 haneli numara doğrulanır; Dijitalpark tek park taslağında\n"
+            "                   31** gibi kısmi maske adla eşleşerek işlenir.\n"
             "   • Ad-Soyad    → personelin adı soyadı\n"
             "   • Tarih       → izin günü, GG.AA.YYYY (her gün AYRI satır)\n"
             "   • Gün         → 1  (tam gün)  veya  0,5  (yarım gün)\n"
-            "   • TGB         → park kodu:  TPI · BV · İYTE · YTP · ULUTEK · ARI · ODTÜ\n\n"
+            "   • TGB         → park kodu: TPI · BV · İYTE · YTP · ULUTEK · DIJITALPARK · ARI · ODTÜ\n"
+            "                   Tek park dosyasında TGB yoksa seçili park kullanılır.\n\n"
             "KURALLAR\n"
             "   • Bir kişinin BİRDEN ÇOK izin günü varsa her gün için 1 satır açılır.\n"
             "   • Aynı T.C. farklı isimle yazılırsa uyarı verir; T.C. esastır (kızlık/evlilik sorunu yaşanmaz).\n"
@@ -2118,7 +2134,8 @@ class IzinGUI:
             "DİKKAT: AYNI PORTAL, FARKLI KOD\n"
             "──────────────────────────────\n"
             "İzin modülü ile DGS modülü aynı portalları kullanır ama park KODLARI farklıdır.\n"
-            "DGS kodu = Excel'in “Lokasyonu SGK” (F) kolonundaki değerdir; resume dosya adlarında\n"
+            "Ortak puantajda DGS kodu “Lokasyonu SGK” kolonundadır; Dijitalpark taslağında\n"
+            "park arayüzde seçilir. Kod resume dosya adlarında\n"
             "da o geçer (ör. dgs_done_Yıldız_Haziran.txt).\n\n"
             "   PORTAL                 İZİN kodu      DGS kodu\n"
             "   ─────────────────────  ───────────    ────────\n"
@@ -2127,6 +2144,7 @@ class IzinGUI:
             "   Teknopark İzmir        İYTE           TPIz     ←\n"
             "   Yıldız Teknopark       YTP            Yıldız   ←\n"
             "   Bursa Ulutek           ULUTEK         Ulutek   ←\n\n"
+            "   Dijitalpark            DIJITALPARK   Dijitalpark\n\n"
             "Artık her iki sekmede de aynı TEKNOKENT ADINI görürsün (ör. “Teknopark İzmir”); yukarıdaki\n"
             "kodlar yalnız DOSYALARDA/Excel'de geçer. DGS Excel'inin “Lokasyonu SGK” (F) kolonu ve resume\n"
             "dosya adları hâlâ DGS kodunu kullanır (ör. dgs_done_Yıldız_Haziran.txt). Yanlış portal açıksa\n"
@@ -2146,10 +2164,14 @@ class IzinGUI:
             "   H → Ar-Ge / Destek        ← Destek'çiler VARSAYILAN OLARAK İŞLENMEZ (4. adımdaki kutu)\n"
             "   N → Eksik puantaj (saat)\n"
             "   W → Proje adı\n\n"
+            "DİJİTALPARK TASLAĞI: Personel, TCKimlikNo, K/L haftalık gün ve saat,\n"
+            "N/O kart basımı süreleri, P DGS süresi ve R proje adı okunur.\n"
+            "P tam teşvik süresinden kısılmışsa kişi otomatik girişte durur; elle işlenir.\n"
+            "6 gün/45 saat programı doğrulanana kadar otomatik girişe kapalıdır.\n\n"
             "SAYFA (sheet): ay adı önceliklidir; farklı ad varsa puantaj başlıklarından bulunur.\n"
             "Sayfa1 gibi değer olarak kopyalanmış tek puantaj sayfası da desteklenir.\n"
             "DÖNEM: bugünden bir ÖNCEKİ ay. Otomatik türetilir.\n\n"
-            "⚠ Bu dosya İZİN Excel'i DEĞİLDİR. İzin Excel'i ayrı bir dosyadır (T.C./Ad-Soyad/Tarih/Gün/TGB).\n"
+            "⚠ Bu dosya İZİN Excel'i DEĞİLDİR. İzin Excel'i ayrı bir dosyadır (T.C./Ad-Soyad/Tarih/Gün; tek parkta TGB isteğe bağlı).\n"
             "   Karıştırırsan motor kişileri bulamaz ve hiçbir şey yazmadan durur."
         ))
 

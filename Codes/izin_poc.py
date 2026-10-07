@@ -322,9 +322,12 @@ _PICK_LI_BY_TC_JS = r"""(args) => {
   const lis=[...document.querySelectorAll('ul.ui-autocomplete li, ul.ui-menu li')].filter(x=>x.offsetParent!==null);
   const cand=lis.map(li=>{const m=li.textContent.match(/(\d{2})\*+(\d{2})/);
     return {li, tcM:(tc && m && m[1]===f2 && m[2]===l2), ov:toks.filter(t=>fold(li.textContent).includes(t)).length};});
-  let pick = tc ? cand.filter(c=>c.tcM) : cand.filter(c=>c.ov===toks.length);
+  const byTc=cand.filter(c=>c.tcM);
+  const exact=byTc.filter(c=>c.ov===toks.length);
+  let pick = tc ? (exact.length===1 ? exact : byTc.length===1 ? byTc : [])
+                : cand.filter(c=>c.ov===toks.length);
   pick.sort((a,b)=>b.ov-a.ov);
-  if(!pick.length) return JSON.stringify({ok:false, reason:(tc?'tc-maske eşleşmedi':'token eşleşmedi')});
+  if(pick.length!==1) return JSON.stringify({ok:false, reason:(tc?'tc-maske eşleşmedi veya belirsiz':'ad eşleşmedi veya belirsiz')});
   const best=pick[0];
   if(tc && best.ov===0) return JSON.stringify({ok:false, reason:'tc eşleşti ama isim HİÇ tutmuyor (güvenlik dur)'});
   const li=best.li, tgt=li.querySelector('a,div')||li;
