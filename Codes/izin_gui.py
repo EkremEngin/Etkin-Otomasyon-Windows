@@ -114,7 +114,7 @@ PDF_TIPLERI = [("PDF belgesi (.pdf)", _uzanti_desenleri((".pdf",))), ("Tüm dosy
 # kodu güncelleyip depoyu yenilemek onu DEĞİŞTİRMEZ, yeniden build edilene kadar eski kodu çalıştırır.
 # Bir kez "yeni sürümü indirdim ama hiçbir şey değişmemiş" diye vakit kaybedildi (2026-09-04).
 # Bu damga arayüzün üst şeridinde ve log'un ilk satırında görünür → hangi build olduğu belli olur.
-SURUM = "2026-10-07.1"
+SURUM = "2026-11-22.1"
 
 def _domain(url: str) -> str:
     return urllib.parse.urlsplit(url or "").netloc.lower()
@@ -153,7 +153,7 @@ IZIN_DISPLAY_TO_CODE = {park_display(p): c for c, p in data.PARKS.items() if p.o
 MODE_TR = {
     "": ("PDF'siz", "Bu park onay için BELGE İSTEMEZ — giriş sonrası doğrudan onaya gider."),
     "per_person": ("Kişi-başı belge", "Her personelin KENDİ izin formu (PDF) gerekir."),
-    "ortak": ("Ortak tek belge", "Firma TÜM çalışanları tek antetli/kaşeli yazıyla (tek PDF) yollar."),
+    "ortak": ("İzin belgeleri", "Kişisel izin formlarının klasörünü veya tüm çalışanları kapsayan ortak PDF'i seçin."),
 }
 
 
@@ -781,6 +781,9 @@ class IzinGUI:
         ctk.CTkButton(row4b, text="Belgeleri denetle", command=self._check_belge, height=28, corner_radius=14,
                       fg_color="transparent", hover_color=UI["card_hover"], text_color=UI["cyan"],
                       font=("Helvetica", 10, "bold")).pack(side="left")
+        self.ortak_belge_btn = ctk.CTkButton(
+            row4b, text="Ortak PDF seç…", command=lambda: self._pick_belge(ortak=True), height=28,
+            fg_color="transparent", hover_color=UI["card_hover"], text_color=UI["cyan"])
         self.belge_info_btn = ctk.CTkButton(row4b, text="İsimlendirme kuralı", command=self._info_belge,
                                              height=28, corner_radius=14, fg_color="transparent",
                                              hover_color=UI["card_hover"], text_color=UI["cyan"],
@@ -1238,32 +1241,24 @@ class IzinGUI:
         self.mode_desc.configure(text=(f"{p.ad}  ·  {p.portal_url}\n"
                                        "İzin onayı ve belge kuralı doğrulanmadı; yalnız taslak giriş."
                                        if not p.onay_dogrulandi else f"{p.ad}  ·  {p.portal_url}\n{desc}{extra}"))
-        # belge bölümü modu
+        belge_aktif = p.belge_klasoru_destekli
+        state = "normal" if belge_aktif else "disabled"
+        self.belge_btn.configure(state=state, text="KLASÖR SEÇ…")
+        self.belge_info_btn.configure(state=state)
+        self.belge_entry.configure(state=state)
+        if belge_aktif and p.onay_pdf == izin_belge.ORTAK:
+            self.ortak_belge_btn.pack(side="left", padx=(10, 0))
+        else:
+            self.ortak_belge_btn.pack_forget()
         if not p.onay_dogrulandi:
-            self.belge_btn.configure(state="disabled")
-            self.belge_info_btn.configure(state="disabled")
-            self.belge_entry.configure(state="disabled")
-            self.belge_lbl.configure(text="Onay ve belge kuralı doğrulanana kadar yalnız taslak kaydedilir.",
-                                     text_color=UI["warning"])
-        elif p.onay_pdf == "":
-            self.belge_btn.configure(state="disabled")
-            self.belge_info_btn.configure(state="disabled")
-            self.belge_entry.configure(state="disabled")
-            self.belge_lbl.configure(text="Bu park belge istemez — bu adımı güvenle atlayabilirsin.", text_color=UI["success"])
-        elif p.onay_pdf == "ortak":
-            self.belge_btn.configure(state="normal", text="Tek PDF Seç…", command=self._pick_belge)
-            self.belge_info_btn.configure(state="normal")
-            self.belge_entry.configure(state="normal")
-            self.belge_lbl.configure(text="Firma tek toplu PDF yolladıysa yalnız o dosyayı seç.", text_color=UI["muted"])
-        else:  # per_person
-            self.belge_btn.configure(state="normal", text="PDF'LERİ SEÇ…", command=self._pick_belge)
-            self.belge_info_btn.configure(state="normal")
-            self.belge_entry.configure(state="normal")
-            # Artık dosya seçicisi açılıyor (klasör seçici hiç dosya göstermiyordu, bkz. _pick_belge).
-            self.belge_lbl.configure(
-                text="PDF'lerin olduğu klasöre gir ve HERHANGİ BİR PDF'i seç — o klasörün tamamı "
-                     "kullanılır, hangisini seçtiğin önemli değil.",
-                text_color=UI["muted"])
+            self.belge_lbl.configure(text="İsteğe bağlı olarak izin klasörünü seçip PDF eşleşmelerini "
+                                          "bilgisayarınızda denetleyebilirsiniz. Portal kaydı taslak kalır.",
+                                     text_color=UI["muted"])
+        elif not p.onay_pdf:
+            self.belge_lbl.configure(text="Bu park belge istemez.", text_color=UI["success"])
+        else:
+            self.belge_lbl.configure(text="Kişisel izin PDF’lerinin bulunduğu klasörü seçin. "
+                                          "Alt klasörler de çalışan adına göre taranır.", text_color=UI["muted"])
         # Belge seçimi YALNIZ park gerçekten değiştiğinde sıfırlanır. _switch_module de burayı
         # çağırıyor; koşulsuz temizlik, İZİN↔DGS sekmesine gidip gelen operatörün seçtiği klasörü
         # sessizce uçuruyordu.
@@ -1485,74 +1480,46 @@ class IzinGUI:
             "“Excel Çalışma Kitabı (*.xlsx)” seç → kaydet, sonra o dosyayı seç.")
         return False
 
-    def _pick_belge(self):
-        # 🔴 topmost log penceresi Windows'ta YEREL dosya diyaloğunu tamamen örtebiliyor; diyalog ana
-        # pencereyi de kilitlediği için uygulama DONMUŞ görünüyor (bkz. _modal_oncesi).
+    def _pick_belge(self, ortak=False):
         self._modal_oncesi()
         p = self._cur_park()
+        if not p.belge_klasoru_destekli or (ortak and p.onay_pdf != izin_belge.ORTAK):
+            return
         masa = izin_frozen.masaustu()
-        if p.onay_pdf == "ortak":
-            # ORTAK mod: park için TEK toplu PDF → dosya seçici.
-            bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
-                                          izin_frozen.indirilenler(), uzantilar=(".pdf",))
-            self._secici_teshis("ortak belge (tek PDF)", bas)
-            f = filedialog.askopenfilename(
-                parent=self.root,
-                title=f"{p.code} — ortak izin belgesi (tek PDF dosyası seç)",
-                filetypes=PDF_TIPLERI,
-                initialdir=bas)
-            self._secici_teshis("ortak belge (tek PDF)", bas, f)
+        bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"),
+                                      izin_frozen.indirilenler(), masa)
+        if ortak:
+            yol = filedialog.askopenfilename(
+                parent=self.root, initialdir=bas, filetypes=PDF_TIPLERI,
+                title=f"{p.code} — tüm çalışanlar için ortak izin PDF'i")
         else:
-            # PER_PERSON mod: motorun istediği şey KLASÖR, ama kullanıcıya DOSYA seçtiriyoruz.
-            #
-            # 🔴 NEDEN (iki kez "hiçbir şey göremiyorum, klasörlerin içi boş" şikâyeti geldi):
-            # Windows'un klasör seçicisi (tk_chooseDirectory → SHBrowseForFolder) tasarımı gereği
-            # HİÇBİR DOSYA GÖSTERMEZ — yalnız klasör ağacı. Operatör PDF'lerini göremeyince doğru
-            # yerde olduğunu doğrulayamıyor ve klasör "boş" sanıyor. Başlığa/etikete uyarı yazmak
-            # yetmedi. Çözüm: normal DOSYA seçicisi aç (PDF'ler GÖRÜNÜR), kullanıcı içlerinden
-            # herhangi birini seçsin, biz o dosyanın KLASÖRÜNÜ alalım. Motora giden değer değişmez.
-            bas = self._baslangic_klasoru("belge", os.path.join(masa, "İzin Belgeleri"), masa,
-                                          uzantilar=(".pdf",))
-            self._secici_teshis("belge klasörü (PDF üzerinden)", bas)
-            secilen = filedialog.askopenfilename(
-                parent=self.root,
-                title=f"{p.code} — izin PDF'lerinin olduğu klasöre gir ve HERHANGİ BİR PDF'i seç",
-                filetypes=PDF_TIPLERI,
-                initialdir=bas)
-            self._secici_teshis("belge klasörü (PDF üzerinden)", bas, secilen)
-            # Seçilen dosyanın klasörü = belge klasörü. Kullanıcı hangi PDF'i seçtiğinin önemi yok.
-            f = os.path.dirname(secilen) if secilen else ""
-        if f:
-            self.belge_path.set(f)
-            self._klasoru_hatirla("belge", f, dosya_mi=(p.onay_pdf == "ortak"))
-            self._belge_secim_ozeti(p, f)
-            self._set_status("Belge kaynağı seçildi", "info")
+            yol = filedialog.askdirectory(
+                parent=self.root, initialdir=bas, mustexist=True,
+                title=f"{p.code} — kişisel izin PDF'lerinin klasörünü seçin")
+        if not yol:
+            return
+        if ortak and not yol.lower().endswith(".pdf"):
+            messagebox.showerror("Ortak izin belgesi", "Ortak belge için bir PDF seçin.")
+            return
+        self.belge_path.set(yol)
+        self._klasoru_hatirla("belge", yol, dosya_mi=ortak)
+        if ortak:
+            ozet = f"Tüm çalışanlara yüklenecek ortak PDF: {os.path.basename(yol)}"
+        else:
+            adet = len(izin_belge._pdfs(yol, recursive=True))
+            ozet = (f"{os.path.basename(yol)} içinde {adet} PDF bulundu. "
+                    "Kişi ve dosya eşleşmelerini görmek için “Belgeleri denetle”yi seçin.")
+        self.belge_lbl.configure(text=ozet, text_color=UI["muted"])
+        self._set_status("Belge kaynağı seçildi", "info")
 
-    def _belge_secim_ozeti(self, park, secim: str):
-        """Seçimin HEMEN ardından "ne seçtim, içinde ne var" de — Excel beklemeden.
-
-        🔴 NEDEN: per_person modda klasör seçici kullanılıyor ve Windows'un klasör seçicisi tasarımı
-        gereği HİÇBİR DOSYA GÖSTERMEZ. Operatör PDF'lerini göremeyince "klasörler boş, yanlış yer
-        seçtim galiba" diye tereddüt ediyor. Ham PDF sayısı bu soruyu anında kapatır (Excel'e,
-        eşleştirmeye gerek yok; ayrıntılı denetim yine "Belgeleri denetle" tuşunda).
-        """
-        try:
-            if park.onay_pdf == "ortak":
-                self.belge_lbl.configure(text=f"Seçilen belge: {os.path.basename(secim)}",
-                                         text_color=UI["success"])
-                return
-            n = len(izin_belge._pdfs(secim))          # ham sayım — isim eşleştirmesi YAPMAZ
-            ad = os.path.basename(secim.rstrip(os.sep)) or secim
-            if n:
-                self.belge_lbl.configure(
-                    text=f"“{ad}” klasöründe {n} PDF bulundu. (Kimin hangi PDF'i aldığını görmek "
-                         f"için “Belgeleri denetle”.)", text_color=UI["success"])
-            else:
-                self.belge_lbl.configure(
-                    text=f"“{ad}” klasöründe hiç PDF yok — PDF'lerin DOĞRUDAN içinde olduğu "
-                         f"klasörü seç (üst klasörü değil).", text_color=UI["warning"])
-        except Exception:  # noqa — özet salt bilgi; okunamıyorsa akışı bozma
-            pass
+    def _belge_kaynagi(self, park):
+        """Klasör ve ortak PDF seçimlerini ön kontrolde ve yüklemede aynı şekilde yorumla."""
+        yol = os.path.expanduser(self.belge_path.get().strip())
+        if not yol or not park.belge_klasoru_destekli:
+            return {}
+        if park.onay_pdf == izin_belge.ORTAK and not os.path.isdir(yol) and yol.lower().endswith(".pdf"):
+            return {"ortak_belge": yol}
+        return {"kisi_klasoru": yol}
 
     # ---------- belge denetimi (portalsız) ----------
     def _check_belge(self):
@@ -1561,12 +1528,12 @@ class IzinGUI:
         if not xl or not os.path.exists(os.path.expanduser(xl)):
             messagebox.showwarning("Excel yok", "Önce geçerli bir İzin Excel'i seç (3. adım).")
             return
-        if p.onay_pdf == "":
+        if not p.belge_klasoru_destekli:
             self.belge_lbl.configure(text="Bu park belge istemez.", text_color=UI["success"])
             self._set_status("Belge adımı gerekmiyor", "success")
             return
         try:
-            by_park, _ = data.read_izin_v2(os.path.expanduser(xl), strict=True)
+            by_park, _ = data.read_izin_v2(os.path.expanduser(xl), strict=True, default_park=p.code)
         except data.DataError as e:
             messagebox.showerror("Excel hatası", f"Excel doğrulanamadı:\n\n{str(e)[:1500]}")
             return
@@ -1575,29 +1542,36 @@ class IzinGUI:
             self.belge_lbl.configure(text=f"{p.code}: Excel'de bu parkta kişi yok.", text_color=UI["warning"])
             self._set_status("Excel'de seçili park için kişi yok", "warning")
             return
-        sel = self.belge_path.get().strip()
-        folder = ortak = None
-        if p.onay_pdf == "ortak":
-            ortak = os.path.expanduser(sel) if sel else None
-            r = izin_belge.readiness(people, None, mode="ortak", ortak_belge=ortak)
-        else:
-            folder = os.path.expanduser(sel) if sel else izin_belge.find_belge_klasor(p)
-            r = izin_belge.readiness(people, folder, mode="per_person")
+        kaynak = self._belge_kaynagi(p)
+        if not p.onay_dogrulandi and not kaynak:
+            self.belge_lbl.configure(text="Eşleşmeleri denetlemek için izin PDF’lerinin klasörünü seçin.",
+                                     text_color=UI["muted"])
+            return
+        r = izin_belge.source_readiness(p, people, **kaynak)
         es, top = r["eslesen"], r["toplam"]
-        miss = [f"{m.ad}" for m in r["missing"]][:6]
-        nonpdf = r["nonpdf"]
-        if es == top and not nonpdf:
-            self.belge_lbl.configure(text=f"✓ {es}/{top} belge hazır → onaya gidebilir.", text_color=UI["success"])
+        if r["hazir"]:
+            self.belge_lbl.configure(text=f"{es}/{top} çalışanın belgesi hazır. Eşleşmeler işlem günlüğünde.",
+                                     text_color=UI["success"])
             self._set_status("Belgeler doğrulandı", "success")
         else:
-            msg = f"⚠ {es}/{top} hazır."
-            if miss:
-                msg += "  Eksik: " + ", ".join(miss) + ("…" if len(r["missing"]) > 6 else "")
-            if nonpdf:
-                msg += f"  PDF-dışı: {len(nonpdf)} dosya (yalnız PDF kabul edilir)."
+            msg = f"{es}/{top} çalışanın belgesi hazır."
+            if r["missing"]:
+                msg += " Eksik: " + ", ".join(m.ad for m in r["missing"][:6])
+                if len(r["missing"]) > 6:
+                    msg += "…"
+            if r["hata"]:
+                msg += " " + r["hata"]
+            if r["nonpdf"]:
+                msg += f" PDF biçiminde gereken dosya: {len(r['nonpdf'])}."
             self.belge_lbl.configure(text=msg, text_color=UI["danger"])
             self._set_status("Belge kontrolü gerekli", "danger")
-        self._log(f"[BELGE] {p.code}: {es}/{top} hazır. klasör={folder or ortak}\n")
+        self._log(f"[BELGE] {p.code}: {es}/{top} hazır.\n")
+        for kisi in people:
+            dosyalar = r["matched"].get(izin_belge.person_key(kisi.tc, kisi.ad), [])
+            yollar = [os.path.relpath(d, r["folder"]) if r["folder"] else os.path.basename(d) for d in dosyalar]
+            self._log(f"  {kisi.ad} → {', '.join(yollar) or 'eşleşen PDF yok'}\n")
+        for dosya in r.get("ambiguous", []):
+            self._log(f"  Belirsiz eşleşme: {dosya}\n")
 
     # ---------- info popup'lar (ÖĞRETİCİ) ----------
     def _info_excel(self):
@@ -1631,34 +1605,21 @@ class IzinGUI:
 
     def _info_belge(self):
         p = self._cur_park()
-        if p.onay_pdf == "ortak":
+        if p.belge_klasoru_destekli:
             txt = (
-                f"{p.code} — ORTAK BELGE MODU\n"
-                "──────────────────────────\n"
-                "Firma, tüm çalışanları listeleyen TEK antetli/kaşeli yazı (tek PDF) yollar.\n\n"
-                "   • Sadece 1 PDF seç — aynı belge o parktaki HERKESİN kaydına yüklenir.\n"
-                "   • Yalnız PDF kabul edilir (Excel/Word reddedilir).\n"
-                "   • Klasörde birden çok PDF varsa hangisi olduğu belirsizdir → tek dosyayı elle seç.\n"
+                "Klasör seç ile izin formlarının bulunduğu klasörü açın. Alt klasörler de taranır.\n\n"
+                "Dosya veya alt klasör adında çalışanın tam adı ya da T.C. kimlik numarası yer alabilir.\n\n"
+                "Ekrem Engin - Yıllık İzin.pdf\n"
+                "Ekrem Engin/İzin Formu (2).pdf\n\n"
+                "Birden çok form aynı çalışana aitse hepsi eşleştirilir. Belgeleri denetle ile "
+                "kişi ve dosya listesini işlem günlüğünde inceleyebilirsiniz."
             )
-        elif p.onay_pdf == "per_person":
-            txt = (
-                f"{p.code} — KİŞİ-BAŞI BELGE MODU\n"
-                "──────────────────────────\n"
-                "Her personelin KENDİ izin formu (PDF) klasörde durur. İsimlendirme:\n\n"
-                "   • Dosya adı = kişinin adı soyadı:   «Ad Soyad.pdf»\n"
-                "        örn.  Abdullah Kızıl.pdf\n"
-                "   • Bir kişide BİRDEN ÇOK belge varsa:  «Ad Soyad (2).pdf», «Ad Soyad (3).pdf»\n"
-                "        örn.  Mehmet Delibaş.pdf · Mehmet Delibaş (2).pdf · Mehmet Delibaş (3).pdf\n"
-                "   • Dosya adında T.C. de geçebilir — o da eşleşir.\n"
-                "   • Portal isim yerine T.C. ile eşler → evlilik/kızlık soyadı farkı SORUN OLMAZ\n"
-                "        (portal 'EZGİ ÇİFTÇİ', dosya 'Ezgi Ustaoğlu Çiftçi.pdf' → yine eşleşir).\n"
-                "   • YALNIZ PDF. Excel/Word gelirse önce PDF'e çevir.\n\n"
-                "Klasör kuralı (varsayılan):\n"
-                f"   {os.path.join(izin_frozen.masaustu(), 'İzin Belgeleri', p.code + ' İzin Belgeleri')}\n"
-                "   (farklı yerdeyse 'Klasör Seç…' ile göster.)"
-            )
+            if p.onay_pdf == izin_belge.ORTAK:
+                txt += "\n\nFirma tek bir toplu izin yazısı verdiyse Ortak PDF seç ile o belgeyi seçin."
+            if not p.onay_dogrulandi:
+                txt += "\n\nBu parkta belge denetimi bilgisayarınızda yapılır. Portalda yalnız taslak kayıt desteklenir."
         else:
-            txt = f"{p.code} — PDF'siz\nBu park onay için belge istemez; 4. adımı atla."
+            txt = f"{p.code} onay için belge istemez."
         self._popup(f"{p.code} belge isimlendirme", txt)
 
     def _popup(self, title, text):
@@ -2322,17 +2283,14 @@ class IzinGUI:
         xl = os.path.expanduser(self.excel_path.get().strip())
         cmd = izin_frozen.worker_cmd("orchestrator") + [
                "--excel", xl, "--parklar", p.code, "--cdp", CDP_URL]
+        kaynak = self._belge_kaynagi(p)
+        if "ortak_belge" in kaynak:
+            cmd += ["--ortak-belge", kaynak["ortak_belge"]]
+        if "kisi_klasoru" in kaynak and (plan or p.onay_dogrulandi):
+            cmd += ["--kisi-belge-klasoru", kaynak["kisi_klasoru"]]
         if plan:
             cmd.append("--plan")
             return cmd
-        if p.onay_pdf == "ortak":
-            sel = self.belge_path.get().strip()
-            if sel:
-                cmd += ["--ortak-belge", os.path.expanduser(sel)]
-        elif p.onay_pdf == "per_person":
-            sel = self.belge_path.get().strip()
-            if sel:
-                cmd += ["--belge-klasor", os.path.expanduser(sel)]
         if self.commit.get():
             cmd.append("--commit")
         if self.onayla.get():

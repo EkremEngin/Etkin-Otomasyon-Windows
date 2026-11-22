@@ -465,7 +465,14 @@ def select_personel(page: Page, portal_ad: str, tc: str | None = None):
             _clear_personel(page); page.wait_for_timeout(1500); continue
         wait_for_form_idle(page)
         log(f"  Personel seçildi: {s['val']} (Personel_Id={s['pid']})")
-        return
+        # Kaydedilen taslağa ait kesin portal ID'sini, maske ve görünen ad ile birlikte sakla.
+        # Soyadı değiştiğinde yükleyici aynı çalışanın formunu bu ID üzerinden tekrar doğrular.
+        picked = re.fullmatch(r"(.+?)\s+(\d{2})\*+(\d{2})", pick.get("picked", "").strip())
+        if picked and re.fullmatch(r"\d{11}", tcs) and picked[2] + picked[3] == tcs[:2] + tcs[-2:]:
+            selected_name = picked[1].strip()
+            if fold(s["val"]) in (fold(selected_name), fold(picked[0])) and str(s["pid"]).isdecimal():
+                return {"ad": selected_name, "id": str(s["pid"])}
+        return None
     raise VerifyError(f"Personel seçilemedi/grid boş: {portal_ad} ({last_err})")
 
 
@@ -699,7 +706,7 @@ def process_one_person(page: Page, person: IzinPerson, first: bool) -> dict:
     else:
         reopen_fresh_form(page)
 
-    select_personel(page, person.portal_ad, getattr(person, "tc", None))
+    portal_person = select_personel(page, person.portal_ad, getattr(person, "tc", None))
     grid = read_grid(page)
     full_min = read_full_day_min(page, grid)
     half_min = full_min // 2
@@ -753,7 +760,7 @@ def process_one_person(page: Page, person: IzinPerson, first: bool) -> dict:
     durum_ek = ""
     if flag:
         durum_ek = " | ⚠ FLAG: " + "; ".join(flag)
-    return {"ad": person.portal_ad, "ok": True, "kaydedildi": "DRY-RUN" not in msg,
+    return {"ad": person.portal_ad, "portal_person": portal_person, "ok": True, "kaydedildi": "DRY-RUN" not in msg,
             "mesaj": f"{msg} (gün={g_val}, saat={s_val}){durum_ek}",
             "girilen": girilen, "atlanan_izin": atlanan_izin, "atlanan_tatil": atlanan_tatil, "flag": flag}
 

@@ -66,6 +66,11 @@ class Park:
     evrak_tipi: str = ""   # PDF'li parkta yükleme "Evrak Tipi" radyo ETİKETİ (park-bazlı; value HARDCODE ETME)
     onay_dogrulandi: bool = True  # False: yalnız taslak izin girişi
 
+    @property
+    def belge_klasoru_destekli(self) -> bool:
+        """PDF yüklenen parklarda ve yalnız taslak desteklenen parkta yerel belge denetimi."""
+        return bool(self.onay_pdf) or not self.onay_dogrulandi
+
 
 PARKS: "OrderedDict[str, Park]" = OrderedDict([
     ("TPI",    Park("TPI",    "Teknopark İstanbul",          "https://argeportal.teknoparkistanbul.com.tr/", "TPI",    True,  "")),
