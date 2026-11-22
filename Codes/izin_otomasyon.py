@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import izin_data_v2 as data
@@ -192,6 +193,7 @@ def run_park_entry(izin_poc, page, park: Park, targets, meta: dict, commit: bool
         log(f"  -> {r['mesaj']}")
         _runlog(park, meta, commit, {"olay": "kisi", "i": i, "ad": person.ad, "tc": person.tc,
                                      "durum": r["durum"], "kaydedildi": bool(r.get("kaydedildi")),
+                                     "portal_person": r.get("portal_person"),
                                      "mesaj": r.get("mesaj"), "girilen": r.get("girilen"),
                                      "flag": r.get("flag"), "excel_gunler": person.gunler})
         if r.get("kaydedildi") and commit:
@@ -337,52 +339,55 @@ def run_approval_pdfsiz(page, park: Park, meta: dict, limit: int, people=None):
 
 
 def run_approval_pdfli(park: Park, meta: dict, people, belge_klasor: str | None, cdp: str, limit: int,
-                       ortak_belge: str | None = None):
-    """PDF'li parklar: belgeleri çöz → HEPSİ hazırsa kanıtlı yükleyiciyi (subprocess) çalıştır.
-    İKİ MOD (park.onay_pdf):
-      • per_person (YTP/ULUTEK) → `--dosya-klasor <folder>`: yükleyici her kişinin belgesini adıyla çözer.
-      • ortak      (İYTE)       → `--dosya <ortak.pdf>` + boş `--dosya-klasor`: kişi-başı çözüm KAPALI,
-        yükleyicinin global-tek-dosya fallback'i herkese aynı belgeyi yükler. (Klasörü geçmiyoruz ki
-        oraya bırakılmış bir "Ad Soyad.pdf" sessizce birine farklı belge yüklemesin.)
-    ADAPTİF: belge eksikse onaya GÖNDERMEZ (giriş taslak kalır), net rapor verir — PDF'li parkları beklemeden
-    PDF'siz parklar koşulabilsin diye. Yükleyici AYRI process (kendi CDP oturumu) → eş-zamanlı bağlantı yok."""
+                       ortak_belge: str | None = None, kisi_klasoru: str | None = None,
+                       kaydedilenler=None, only_person: str | None = None):
+    """Belge denetiminde bulunan kişisel dosyaları ya da parkın ortak PDF'ini yükleyiciye ilet."""
     ay_key = meta["ay_key"]
     done_file = f"izin_done_{park.label}_{ay_key}.txt"
     if not os.path.exists(done_file):
         log(f"[ONAY] {park.code}: {done_file} yok — önce giriş (--commit) gerekli. Atlanıyor.")
         return
-    folder = izin_belge.find_belge_klasor(park, base=belge_klasor)
-    r = izin_belge.report(park, people, folder=folder, ortak_belge=ortak_belge)
-    if r["eslesen"] != r["toplam"] or r["nonpdf"]:
-        log(f"[ONAY] {park.code}: belgeler TAM DEĞİL ({r['eslesen']}/{r['toplam']}"
-            f"{', PDF-dışı var' if r['nonpdf'] else ''}{', ' + r['hata'] if r['hata'] else ''}) "
-            f"→ onaya GÖNDERİLMEDİ (adaptif). Giriş TASLAK kaldı; eksiği tamamlayıp tekrar `--onayla` çalıştır.")
+    r = izin_belge.report(park, people, base=belge_klasor, kisi_klasoru=kisi_klasoru,
+                          ortak_belge=ortak_belge)
+    if not r["hazir"]:
+        log(f"[ONAY] {park.code}: {r['eslesen']}/{r['toplam']} çalışanın belgesi eşleşti. "
+            f"{r['hata']} Belgeler tamamlanana kadar kayıtlar taslak kalacak.")
         return
     import izin_frozen   # donmuş (.exe) modda uploader'ı token'la çağır; script modunda .py — davranış AYNI
     cmd = izin_frozen.worker_cmd("uploader") + ["--lokasyon", park.label, "--sheet", ay_key,
            "--donem", meta["donem_label"]]
-    if r["mod"] == izin_belge.ORTAK:
-        cmd += ["--dosya", r["ortak"], "--dosya-klasor", ""]
-        nasil = f"ORTAK belge → {r['toplam']} kişinin hepsine '{os.path.basename(r['ortak'])}'"
-    else:
-        cmd += ["--dosya-klasor", folder]
-        nasil = f"{r['toplam']} kişi-başı belge hazır ✓"
     if limit:
         cmd += ["--limit", str(limit)]
     env = os.environ.copy()
     env["DGS_CDP"] = cdp
-    log(f"\n[ONAY] {park.code}: {nasil} → yükle+onaya gönder (makinalı tüfek):")
-    log("   $ " + " ".join(f'"{c}"' if (" " in c or not c) else c for c in cmd))
-    # cwd=data_dir() ŞART (SCRIPT_DIR DEĞİL): yükleyici iş listesini izin_done_*.txt'den GÖRELİ yolla
-    # okur. Donmuş exe'de SCRIPT_DIR = geçici _MEIPASS → dosya orada yok → "HATA: ... yok", exit(1).
-    subprocess.run(cmd, stdin=subprocess.DEVNULL, env=env, cwd=izin_frozen.data_dir())
+    # Geçici dizin Windows'ta da alt süreç açıkken okunabilsin. Eşleşmeler işlem sonunda silinir.
+    with tempfile.TemporaryDirectory() as tempdir:
+        if r["mod"] == izin_belge.ORTAK:
+            cmd += ["--dosya", r["ortak"], "--dosya-klasor", ""]
+            if only_person:
+                cmd += ["--person", only_person]
+        else:
+            dosya_listesi = []
+            for kisi in people:
+                key = izin_belge.person_key(kisi.tc, kisi.ad)
+                if kaydedilenler is None or key in kaydedilenler:
+                    dosya_listesi.append({"tc": kisi.tc, "ad": kisi.ad, "files": r["matched"][key]})
+            if not dosya_listesi:
+                log("[ONAY] Bu koşuda belgeleri yüklenecek taslak bulunmadı.")
+                return
+            manifest = os.path.join(tempdir, "belgeler.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump(dosya_listesi, f, ensure_ascii=False)
+            cmd += ["--belge-listesi", manifest]
+        log(f"[ONAY] {park.code}: doğrulanan izin belgeleri yükleyiciye iletiliyor.")
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, env=env, cwd=izin_frozen.data_dir(), check=True)
 
 
 # ---------------------------------------------------------------------------
 # Plan modu (portalsız ön-uçuş — offline test edilebilir)
 # ---------------------------------------------------------------------------
 def run_plan(excel: str, parklar, belge_klasor: str | None, detay: bool = True,
-             ortak_belge: str | None = None, default_park: str | None = None):
+             ortak_belge: str | None = None, default_park: str | None = None, kisi_klasoru: str | None = None):
     by_park, meta = data.read_izin_v2(excel, strict=True,
                                      default_park=default_park or (parklar[0].code if parklar and len(parklar) == 1 else None))
     print("=" * 74)
@@ -398,25 +403,29 @@ def run_plan(excel: str, parklar, belge_klasor: str | None, detay: bool = True,
     for code in order:
         pk = PARKS[code]
         people = by_park[code]
-        if not pk.onay_dogrulandi:
-            pdf = "  [ONAY: doğrulanmadı, yalnız taslak]"
-        elif pk.onay_pdf:
-            folder = izin_belge.find_belge_klasor(pk, base=belge_klasor)
-            rd = izin_belge.readiness(people, folder, mode=pk.onay_pdf, ortak_belge=ortak_belge)
-            hazir = rd["eslesen"] == rd["toplam"] and not rd["nonpdf"]
-            if pk.onay_pdf == izin_belge.ORTAK:
-                durum = (f"ORTAK belge '{os.path.basename(rd['ortak'])}' HAZIR ✓" if hazir
-                         else f"ORTAK belge ⚠ {rd['hata'] or 'PDF-dışı dosya var'}")
+        rd = None
+        if pk.onay_pdf or (not pk.onay_dogrulandi and (kisi_klasoru or belge_klasor)):
+            rd = izin_belge.source_readiness(pk, people, base=belge_klasor, ortak_belge=ortak_belge,
+                                             kisi_klasoru=kisi_klasoru)
+            if rd["mod"] == izin_belge.ORTAK:
+                durum = (f"ORTAK belge '{os.path.basename(rd['ortak'])}' HAZIR ✓" if rd["hazir"]
+                         else f"ORTAK belge ⚠ {rd['hata'] or 'Eksik'}")
             else:
-                durum = f"kişi-başı belge {rd['eslesen']}/{rd['toplam']}" + (" HAZIR ✓" if hazir else
-                         (" ⚠ klasör YOK" if not folder else " ⚠ EKSİK"))
-            pdf = f"  [ONAY: {durum}]"
+                durum = f"kişi-başı belge {rd['eslesen']}/{rd['toplam']}"
+                durum += " HAZIR ✓" if rd["hazir"] else f" ⚠ {rd['hata'] or 'EKSİK'}"
+            pdf = f"  [ONAY: {durum}]" if pk.onay_dogrulandi else f"  [TASLAK · yerel denetim: {durum}]"
+        elif not pk.onay_dogrulandi:
+            pdf = "  [ONAY: doğrulanmadı, yalnız taslak]"
         else:
             pdf = "  [ONAY: PDF'siz, direkt]"
         print(f"\n### {pk.code} — {len(people)} kişi{pdf}  → {pk.portal_url}")
         if detay:
             for p in people:
                 print(f"    {p.ad:32s} T.C.{p.tc} | {p.toplam_gun:>4}g | {[d for d,_ in p.gunler]}")
+                if rd and rd["mod"] == izin_belge.PER_PERSON:
+                    files = rd["matched"].get(izin_belge.person_key(p.tc, p.ad), [])
+                    paths = [os.path.relpath(f, rd["folder"]) for f in files]
+                    print(f"      PDF: {', '.join(paths) or 'eşleşme yok'}")
     if parklar:
         atlanan = [c for c in by_park if PARKS[c].otomasyon and c not in order]
         if atlanan:
@@ -443,7 +452,9 @@ def main():
     ap.add_argument("--park", default=None, help="Tek parkı zorla/doğrula (yoksa açık portaldan otomatik algılanır)")
     ap.add_argument("--belge-klasor", default=None,
                     help="PDF'li park için belge klasörü. Yoksa Masaüstü konvansiyonu (~/Desktop/İzin Belgeleri/<Park> İzin Belgeleri) aranır.")
-    ap.add_argument("--ortak-belge", default=None,
+    kaynak = ap.add_mutually_exclusive_group()
+    kaynak.add_argument("--kisi-belge-klasoru", help="Kişisel izin PDF'lerinin aranacağı klasör ve alt klasörleri.")
+    kaynak.add_argument("--ortak-belge", default=None,
                     help="ORTAK modlu parkta (İYTE) toplu belgenin yolu — klasör keşfini baypas eder. "
                          "Aynı PDF o parktaki HERKESİN kaydına yüklenir.")
     ap.add_argument("--commit", action="store_true", help="TASLAK kaydet (yoksa DRY-RUN)")
@@ -476,7 +487,7 @@ def main():
 
     if args.plan:
         run_plan(excel, parklar, args.belge_klasor, ortak_belge=args.ortak_belge,
-                 default_park=args.park)
+                 default_park=args.park, kisi_klasoru=args.kisi_belge_klasoru)
         return
 
     # --- Canlı: Playwright motorunu şimdi import et (plan modunda gereksiz) ---
@@ -540,8 +551,11 @@ def main():
 
     # oturum kapandı → PDF'li park onayı (belge çöz + kanıtlı yükleyici subprocess)
     if args.onayla and args.commit and active and active.otomasyon and active.onay_pdf:
+        kaydedilenler = {izin_belge.person_key(r["tc"], r["ad"]) for r in results
+                         if r["durum"] in ("girildi", "zaten_girili")}
         run_approval_pdfli(active, meta, targets, args.belge_klasor, cdp, args.limit,
-                           ortak_belge=args.ortak_belge)
+                           ortak_belge=args.ortak_belge, kisi_klasoru=args.kisi_belge_klasoru,
+                           kaydedilenler=kaydedilenler, only_person=args.person)
 
     log("\nHATIRLATMA: Giriş TASLAK. PDF'siz parklar --onayla ile onaya gitti; PDF'li parklar belge hazırsa gitti, "
         "değilse taslak kaldı (adaptif).")

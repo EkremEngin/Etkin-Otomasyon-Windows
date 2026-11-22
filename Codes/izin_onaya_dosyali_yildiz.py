@@ -10,7 +10,7 @@ tek global `--dosya` yerine, her kişinin belge(ler)i `--dosya-klasor`'dan DGS A
 kişide kaç belge varsa HEPSİ sırayla yüklenir (örn. SENANUR IŞIK → 3 dosya = 3 upload). Geri kalan
 her şey (liste, çift-tık, Onaya Gönder, Evet, doğrulama, resume) tabandakiyle BİREBİR aynıdır.
 
-Belge eşleştirme: klasördeki dosyalar "AD SOYAD.ext" veya "AD SOYAD (n).ext" formatında (bu repo'da
+Belge eşleştirme: klasördeki dosyalar "AD SOYAD.pdf" veya "AD SOYAD (n).pdf" formatında (bu repo'da
 DGS adlarına göre yeniden adlandırıldı). Kişinin portal-adı fold() ile dosya adına eşlenir; (n) sırasına
 göre 1→2→3 yüklenir. Klasörde belgesi olmayan kişi onaya GÖNDERİLMEZ (atlanır, uyarılır — elle yükle).
 
@@ -29,6 +29,8 @@ DOĞRULAR. Resume: `izin_onaya_done_<lok>_<sheet>.txt`. GERİ ALINMASI ZOR (resm
    (b) portal SADECE PDF kabul (.xlsm/.xlsx → "Dosya tipi desteklenmemektedir") → Excel formlar
        LibreOffice ile 1-sayfa PDF'e çevrilip yüklendi (orijinaller _xlsx_orijinal/'de).
 
+Orkestratör --belge-listesi ile ön kontrolde kişi başına doğrulanan PDF yollarını iletir.
+
 Bayraklar: --dosya-klasor (kişi-başı belge klasörü), --person (tek kişi/retry, whitelist korur),
            --sadece-yukle (onaya GÖNDERMEDEN test), PROBE_UPLOAD=1 env (evrak-tipi/upload-fail modal dump).
 Kullanım (lokasyon default=Yıldız):
@@ -37,21 +39,25 @@ Kullanım (lokasyon default=Yıldız):
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 import re
 import sys
-import time
+import unicodedata
+from collections import defaultdict
+from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
 
-from izin_data import fold
+from izin_belge import portal_filename, resolve_person_files
+from izin_data_v2 import fold, resolve_park
 
 CDP = os.environ.get("DGS_CDP", "http://localhost:9222")  # paralel park için: DGS_CDP ile port ver (9222 BV / 9223 TPIz)
 DONEM_LABEL = "MAYIS 2026"   # dönem ETİKETİ — park-bazlı Donem_Id değişir → etiketle seç (Plan §5.2)
 LOG = "[ONAY]"
 
 # JS tarafı Türkçe-fold (Python fold ile aynı kural)
-_JS_FOLD = r"""const fold=s=>{const tr={'ç':'c','Ç':'c','ğ':'g','Ğ':'g','ı':'i','İ':'i','I':'i','ö':'o','Ö':'o','ş':'s','Ş':'s','ü':'u','Ü':'u'};
+_JS_FOLD = r"""const fold=s=>{const tr={'ç':'c','Ç':'c','ğ':'g','Ğ':'g','ı':'i','İ':'i','I':'i','ö':'o','Ö':'o','ş':'s','Ş':'s','ü':'u','Ü':'u','â':'a','Â':'a','î':'i','Î':'i','û':'u','Û':'u'};
   return s.split('').map(c=>tr[c]||c).join('').toLowerCase().replace(/\s+/g,' ').trim();};"""
 
 
@@ -59,32 +65,102 @@ def log(*a):
     print(LOG, *a, flush=True)
 
 
-_NUM_SUFFIX = re.compile(r"\s*\((\d+)\)\s*$")   # " (1)", " (2)" ... son eki
+def _mask_key(tc):
+    if re.fullmatch(r"[0-9]{11}", tc):
+        return tc[:2] + tc[-2:]
+    if re.fullmatch(r"[0-9]{2}\*+(?:[0-9]{2})?", tc):
+        return tc.replace("*", "")
+    return ""
 
 
-def resolve_person_files(folder: str, name: str) -> list[str]:
-    """Klasörde bu KİŞİYE ait belge(ler)i isimle çöz.
-    Dosya adı 'AD SOYAD.ext' veya 'AD SOYAD (n).ext' (DGS adıyla adlandırılmış). fold() ile eşleşir
-    (büyük/küçük + Türkçe diakritik bağımsız). (n) numarasına göre sıralı (1→2→3) tam yol listesi döner.
-    Eşleşme yoksa boş liste."""
-    if not folder or not os.path.isdir(folder):
-        return []
-    nf = fold(name)
-    found: list[tuple[int, str]] = []
-    for f in sorted(os.listdir(folder)):
-        if f.startswith(".") or f.startswith("_"):
+def saved_portal_people(path, park_code, donem):
+    """Yalnız bu park ve dönemde başarıyla kaydedilmiş taslakların kişi kimliğini al."""
+    found = defaultdict(set)
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as log_file:
+            for line in log_file:
+                try:
+                    record = json.loads(line)
+                except ValueError:  # yarım kalmış günlük satırı kimlik kanıtı değildir
+                    continue
+                if not isinstance(record, dict) or not (record.get("park") == park_code
+                        and record.get("donem") == donem and record.get("commit") is True
+                        and record.get("kaydedildi") is True and record.get("durum") == "girildi"):
+                    continue
+                tc, name = str(record.get("tc", "")), fold(record.get("ad"))
+                portal = record.get("portal_person")
+                if not isinstance(portal, dict) or not re.fullmatch(r"[0-9]{11}", tc):
+                    continue
+                portal_name, pid = fold(portal.get("ad")), str(portal.get("id", ""))
+                if portal_name and re.fullmatch(r"[1-9][0-9]*", pid):
+                    found[(tc, name)].add((portal_name, pid))
+    return found
+
+
+def load_file_plan(path, done_pairs, person="", saved_people=None):
+    """Ön kontroldeki dosyaları yalnız bu koşunun kaydedilmiş taslaklarına bağla."""
+    with open(path, encoding="utf-8") as source:
+        rows = json.load(source)
+    if not isinstance(rows, list):
+        raise ValueError("Belge listesi geçersiz.")
+
+    done = {(tc.strip(), fold(ad)) for tc, ad in done_pairs}
+    same_name = defaultdict(set)
+    for tc, ad in done:
+        if tc:
+            same_name[ad].add(tc)
+    files_used = set()
+    entries = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Belge listesinde geçersiz satır.")
+        tc, ad, files = row.get("tc"), row.get("ad"), row.get("files")
+        if not isinstance(tc, str) or not _mask_key(tc) or not fold(ad):
+            raise ValueError("Belge listesinde geçersiz kimlik.")
+        identity = (tc, fold(ad))
+        if identity in entries or not isinstance(files, list) or not files:
+            raise ValueError(f"{ad} için belge listesi eksik veya yinelenmiş.")
+        row = {"tc": tc, "ad": ad, "files": files}
+        for file in files:
+            if not (isinstance(file, str) and os.path.isabs(file) and
+                    file.lower().endswith(".pdf") and os.path.isfile(file)):
+                raise ValueError(f"{ad} için listedeki PDF okunamadı.")
+            real = os.path.normcase(os.path.realpath(file))
+            if real in files_used:
+                raise ValueError(f"{ad} için aynı PDF birden fazla kez eşleşmiş.")
+            files_used.add(real)
+        portal_name = identity[1]
+        known = (saved_people or {}).get(identity, set())
+        if known and identity in done:
+            if len(known) != 1:
+                raise ValueError(f"{ad} için taslak günlüğünde çelişen portal kimlikleri var.")
+            verified_name, pid = next(iter(known))
+            # Sadece maske ve tek ortak kelimeyle farklı bir soyada belge bağlama.
+            if verified_name != portal_name and len(set(verified_name.split()) & set(portal_name.split())) >= 2:
+                portal_name = verified_name
+                row = dict(row, portal_id=pid)
+        entries[identity] = (row, portal_name)
+        same_name[portal_name].add(tc)
+        same_name[identity[1]].add(tc)
+
+    result = {}
+    for (tc, name), (row, portal_name) in entries.items():
+        if person and person.strip() != tc and fold(person) != name:
             continue
-        p = os.path.join(folder, f)
-        if not os.path.isfile(p):
+        if (tc, name) not in done and ("", name) not in done:
             continue
-        stem = os.path.splitext(f)[0]
-        m = _NUM_SUFFIX.search(stem)
-        num = int(m.group(1)) if m else 0
-        core = _NUM_SUFFIX.sub("", stem)
-        if fold(core) == nf:
-            found.append((num, p))
-    found.sort()
-    return [p for _, p in found]
+        if (tc, name) not in done and len(same_name[name]) != 1:
+            raise ValueError(f"{row['ad']} için eski devam kaydının kimliği belirsiz.")
+        mask = _mask_key(tc)
+        for other in same_name[portal_name] - {tc}:
+            other_mask = _mask_key(other)
+            if other_mask.startswith(mask) or mask.startswith(other_mask):
+                raise ValueError(f"{row['ad']} için portalda ayırt edilemeyen kimlikler var.")
+        key = f"{portal_name}\t{mask}"
+        if key in result:
+            raise ValueError(f"{row['ad']} için aynı portal kaydına bağlı birden fazla belge planı var.")
+        result[key] = row
+    return result
 
 
 def set_donem_by_label(page, label: str):
@@ -104,6 +180,44 @@ def set_donem_by_label(page, label: str):
         return s?s.value:'';}""")
     if got != val:
         raise RuntimeError(f"Dönem set edilemedi (value={got!r} != {val!r}, label={label!r}).")
+
+
+def pending_plan_files(page, paths):
+    """Geçerli her portal satırında tek bir dosya adı gerekir. Yalnız eksik yolları döndür."""
+    expected = {}
+    for path in paths:
+        name = portal_filename(path)
+        if name in expected:
+            raise ValueError(f"Seçilen PDF'ler portalda aynı dosya adıyla görünecek: {name}")
+        expected[name] = path
+
+    rows = page.evaluate(r"""()=>{
+        const modal=[...document.querySelectorAll('.modal.in,.modal.show,.ui-dialog')].find(el=>
+            el.offsetParent!==null && /Dosya Y[üu]kleme/i.test(el.innerText));
+        if(!modal)return null;
+        const docs=[];
+        for(const row of modal.querySelectorAll('tr')){
+            const text=row.innerText;
+            const names=[...row.querySelectorAll('td,a,span')]
+                .map(el=>el.textContent.trim()).filter(value=>/\.pdf$/i.test(value));
+            if(/Hata|Ba[şs]ar[ıi]s[ıi]z/i.test(text))continue;
+            if(/\d\s*[KM]B\b/i.test(text))docs.push([...new Set(names)]);
+            else if(names.length)throw new Error('Yüklenen dosyanın durumu okunamadı.');
+        }
+        return docs;
+    }""")
+    if rows is None:
+        raise RuntimeError("Dosya yükleme penceresi okunamadı.")
+    seen = set()
+    for row in rows:
+        names = {unicodedata.normalize("NFC", value).strip() for value in row}
+        if len(names) != 1:
+            raise ValueError("Yüklü satırda tek bir PDF adı doğrulanamadı.")
+        name = names.pop()
+        if name not in expected or name in seen:
+            raise ValueError(f"Yüklü PDF beklenmiyor veya birden fazla kez yüklenmiş: {name}")
+        seen.add(name)
+    return [path for name, path in expected.items() if name not in seen]
 
 
 def wait_ajax(page, timeout=20000, settle=80):
@@ -127,6 +241,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--dosya-klasor", default="/Users/ekoreiz/Downloads/Yıldız İzin Formları",
                     help="Her kişinin belge(ler)inin DGS adıyla (AD SOYAD[ (n)].ext) durduğu klasör. Kişiye ait TÜM belgeler sırayla yüklenir.")
+    ap.add_argument("--belge-listesi", help="Ön kontrolde doğrulanan kişi ve PDF yollarının JSON listesi.")
     ap.add_argument("--dosya", default="",
                     help="(Opsiyonel) FALLBACK tek dosya — klasörde kişinin belgesi YOKSA bu yüklenir. Boş='' → fallback yok.")
     ap.add_argument("--sadece-yukle", action="store_true",
@@ -135,7 +250,7 @@ def main():
                     help="Sadece bu kişiyi işle (izin_done içinde OLMALI — whitelist korunur). Tek-kişi test/retry için.")
     args = ap.parse_args()
     donem = args.donem   # dönem etiketi — JS desenlerine + set_donem'e parametrik geçer (Mayıs varsayılan → davranış korunur)
-    if args.dosya_klasor and not os.path.isdir(args.dosya_klasor):
+    if not args.belge_listesi and args.dosya_klasor and not os.path.isdir(args.dosya_klasor):
         log(f"UYARI: --dosya-klasor bulunamadı: {args.dosya_klasor!r} (kişi-başı belge çözülemeyecek; sadece --dosya fallback varsa yüklenir)")
 
     done_file = f"izin_done_{args.lokasyon}_{args.sheet}.txt"
@@ -149,7 +264,21 @@ def main():
             continue
         parts = l.split("\t")
         pairs.append((parts[0] if len(parts) > 1 else "", parts[-1]))
-    if args.person:                                   # tek-kişi: whitelist'i o kişiye daralt (güvenlik korunur)
+    file_plan = None
+    if args.belge_listesi:
+        try:
+            park = resolve_park(args.lokasyon)
+            if not park or not park.onay_pdf or not park.onay_dogrulandi:
+                ap.error("Seçilen parkta belge yükleme desteği doğrulanmadı.")
+            history = saved_portal_people(f"izin_runlog_{park.label}_{args.sheet}.jsonl", park.code, donem)
+            file_plan = load_file_plan(args.belge_listesi, pairs, args.person, history)
+        except (OSError, ValueError) as exc:
+            ap.error(str(exc))
+        pairs = [(row["tc"], row["ad"]) for row in file_plan.values()]
+        if not pairs:
+            log("Belge listesinde bu koşu için kaydedilmiş taslak yok.")
+            return
+    elif args.person:                                 # tek-kişi: whitelist'i o kişiye daralt (güvenlik korunur)
         pf = fold(args.person)
         keep = [(tc, ad) for (tc, ad) in pairs
                 if pf == fold(ad) or pf in fold(ad) or args.person.strip() == str(tc).strip()]
@@ -174,7 +303,15 @@ def main():
 
     with sync_playwright() as pw:
         browser = pw.chromium.connect_over_cdp(CDP)
-        page = next((p for p in browser.contexts[0].pages if "argeportal" in (p.url or "")), None)
+        if file_plan is not None:
+            park = resolve_park(args.lokasyon)
+            host = urlsplit(park.portal_url).hostname if park else None
+            tabs = [p for p in browser.contexts[0].pages if host and urlsplit(p.url).hostname == host]
+            if len(tabs) != 1:
+                ap.error("Belge yüklemek için seçilen parkın tek bir portal sekmesi açık olmalı.")
+            page = tabs[0]
+        else:
+            page = next((p for p in browser.contexts[0].pages if "argeportal" in (p.url or "")), None)
         if page is None:
             log("Portal sekmesi yok."); sys.exit(1)
 
@@ -232,16 +369,29 @@ def main():
 
         # İlk "Gönderilmemiş" taslağı aç (bizim setten, failed olmayan). Adı döndür; yoksa null.
         # Ay etiketi (donem) grid satırında görünür → JS regex'lerine GÖMÜLÜR (park/ay-agnostik; Mayıs'ta orijinalle bit-bit aynı).
-        FIND_FIRST = (r"""(args)=>{const [our, failed, ourTc]=args; %s
+        FIND_FIRST = (r"""(args)=>{const [our, failed, ourTc, planned]=args; %s
+          const rows=[];
           for(const tr of document.querySelectorAll('tr')){
             const t=tr.innerText.replace(/\s+/g,' ').trim();
-            if(!/%s/.test(t)||!/Değerlendirmeye Gönderilmemiş/.test(t))continue;
-            const m=t.match(/%s\s+(.+?)\s+(\d+)\*+(\d+)/); if(!m)continue;
-            const nf=fold(m[1]); const tcKey=m[2]+m[3];
-            if(failed.includes(nf)||failed.includes(tcKey))continue;
-            if(!our.includes(nf) && !ourTc.includes(tcKey)) continue;   // GÜVENLİK: bizim (isim VEYA maskeli-T.C. — kızlık/evlilik farkında da tutar)
-            tr.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,view:window})); return [m[1].trim(), tcKey];}
-          return null;}""") % (_JS_FOLD, donem, donem)
+            const m=t.match(/%s\s+(.+?)\s+(\d{2})\*+(\d{2})/);
+            if(!m || !tr.getClientRects().length || tr.querySelector('tr'))continue;
+            rows.push({tr, t, name:m[1].trim(), nf:fold(m[1]), mask:m[2]+m[3]});}
+          for(const row of rows){
+            if(!row.t.includes('Değerlendirmeye Gönderilmemiş'))continue;
+            const key=row.nf+'\t'+row.mask;
+            if(failed.includes(key))continue;
+            let planKey=null;
+            if(planned!==null){
+              const prefixKey=row.nf+'\t'+row.mask.slice(0,2);
+              planKey=planned.includes(key)?key:planned.includes(prefixKey)?prefixKey:null;
+              if(!planKey)continue;
+              // Bir görünür kimlik iki satıra uyuyorsa çalışan ve taslak ayırt edilemez.
+              const mask=planKey===key?row.mask:row.mask.slice(0,2);
+              if(rows.filter(r=>r.nf===row.nf && r.mask.startsWith(mask)).length!==1)continue;
+            }else if(!our.includes(row.nf) && !ourTc.includes(row.mask))continue;
+            row.tr.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,view:window}));
+            return [row.name,row.mask,planKey];}
+          return null;}""") % (_JS_FOLD, re.escape(donem))
 
         # Bir ismin hâlâ "Gönderilmemiş" satırı var mı? (onay doğrulaması)
         STILL_DRAFT = (r"""(args)=>{const [nm]=args; %s const nf=fold(nm);
@@ -259,10 +409,10 @@ def main():
 
         # Kişinin listedeki GERÇEK OnayDurumu'nu (string) döndür — onay doğrulaması için (body-text banner GÜVENİLMEZ).
         # 'Değerlendirmeye Gönderilmemiş'=taslak; 'Değerlendirme Bekleyen'/'...Gönderilmiş'/'...Onaylanmış'=onaya gitti.
-        STATUS_OF = (r"""(nf)=>{const STAT=['Yönetici Şirket Tarafından Onaylanmış','Değerlendirmeye Gönderilmemiş','Değerlendirme Bekleyen','Değerlendirmeye Gönderilmiş','Onaylanmış','İmzalanmış','Reddedilmiş']; %s
+        STATUS_OF = (r"""([nf,mask])=>{const STAT=['Yönetici Şirket Tarafından Onaylanmış','Değerlendirmeye Gönderilmemiş','Değerlendirme Bekleyen','Değerlendirmeye Gönderilmiş','Onaylanmış','İmzalanmış','Reddedilmiş']; %s
           for(const tr of document.querySelectorAll('tr')){const t=tr.innerText.replace(/\s+/g,' ').trim();
-            if(!/%s/.test(t))continue; const m=t.match(/%s\s+(.+?)\s+\d+\*+\d+/); if(!m)continue;
-            if(fold(m[1])===nf){for(const s of STAT)if(t.includes(s))return s; return '(?)';}}
+            if(!/%s/.test(t))continue; const m=t.match(/%s\s+(.+?)\s+(\d{2})\*+(\d{2})/); if(!m)continue;
+            if(fold(m[1])===nf && m[2]+m[3]===mask){for(const s of STAT)if(t.includes(s))return s; return '(?)';}}
           return null;}""") % (_JS_FOLD, donem, donem)
 
         def reset_list_filter():
@@ -275,9 +425,11 @@ def main():
         open_list()
         ok = 0
         failed = set()
-        skipped_onay = [x for x in our if x in onaylanan]
+        processed = set()
+        processed_plan_keys = set()
+        planned_keys = list(file_plan) if file_plan is not None else None
         # zaten onaya gönderilmişleri başta resume'a yazılı say
-        for _iter in range(len(our) + 25):
+        for _iter in range(len(pairs) + 25):
             if ok >= limit:
                 break
             if not list_open():        # liste kapandıysa yeniden aç (filtre+dönem ile)
@@ -285,16 +437,37 @@ def main():
             else:
                 reset_list_filter()    # liste açık ama filtre sıfırlanmış olabilir → dönem+TÜM durum yenile
             listele()
-            res = page.evaluate(FIND_FIRST, [list(our), list(failed), list(our_tc)])
+            res = page.evaluate(FIND_FIRST, [list(our), list(failed | processed), list(our_tc), planned_keys])
             if not res:
-                foreign = page.evaluate(FOREIGN_LEFT, [list(our)])
-                log(f"Bizim gönderilmemiş taslak kalmadı. (bizim-olmayan kalan taslak: {foreign})")
+                if file_plan is not None:
+                    log("Görünen listede belge planıyla adı ve kimliği eşleşen başka bir taslak bulunamadı.")
+                else:
+                    foreign = page.evaluate(FOREIGN_LEFT, [list(our)])
+                    log(f"Bizim gönderilmemiş taslak kalmadı. (bizim-olmayan kalan taslak: {foreign})")
                 break
-            name, tcKey = res[0], res[1]                    # name=grid(portal) adı; tcKey=maskeli T.C. ilk2+son2
-            belge_ad = name_by_tc.get(tcKey, name)          # belgeyi Excel/DGS adıyla çöz (portal adı kızlık/evlilikte farklı olabilir)
+            name, tcKey, plan_key = res
+            row_key = f"{fold(name)}\t{tcKey}"
+            if file_plan is not None:
+                belge_ad = file_plan[plan_key]["ad"]
+                dosyalar = file_plan[plan_key]["files"]
+            else:
+                belge_ad = name_by_tc.get(tcKey, name)
+                dosyalar = resolve_person_files(args.dosya_klasor, belge_ad)
+                if not dosyalar and fold(belge_ad) != fold(name):
+                    dosyalar = resolve_person_files(args.dosya_klasor, name)
+                if not dosyalar and args.dosya:
+                    dosyalar = [args.dosya]
             if fold(belge_ad) != fold(name):
                 log(f"   ℹ️ İSİM UYUŞMAZLIĞI: portal='{name}' ↔ Excel='{belge_ad}' (T.C.…{tcKey}) — T.C. ile eşlendi.")
             wait_ajax(page)   # form açıldı — loading bitene kadar bekle (acele etme)
+            if file_plan is not None and file_plan[plan_key].get("portal_id"):
+                form = page.get_by_role("dialog", name=re.compile(r"Personel İzin Bildirim Formu(?! Listesi)"))
+                field = form.locator("input[type=hidden][name='Personel_Id']")
+                if field.count() != 1 or field.input_value() != file_plan[plan_key]["portal_id"]:
+                    failed.add(row_key)
+                    log(f"!! {name}: açık formun personel ID'si kaydedilen taslakla doğrulanamadı.")
+                    close_form()
+                    continue
             # 🔴 ÖNCEKİ kişiden kalan confirm/alert modal'ı DOM'dan KALDIR — birikince "Dosya Yükle"/Evet click'ini
             #   bloklar + duplicate #modalYes → yanlış-pozitif onay (2026-06-19 bulk2: ilk 10 'Dosya Yükle' timeout;
             #   MEHMET KORAL diag: stale 'başarı' banner). Form ve "Dosya Yükleme Modülü"ne DOKUNMA.
@@ -315,13 +488,8 @@ def main():
             # Radyoyu ETİKETLE seç (value park-bazlı: TPIz=54; "value HARDCODE ETME" kuralı).
             # 🌟 YILDIZ: tek global dosya yerine KİŞİNİN KENDİ belge(ler)ini klasörden çöz → HEPSİNİ sırayla yükle.
             #   (örn. SENANUR IŞIK → 3 belge = 3 ayrı upload). Tek-dosyada davranış tabandakiyle aynıdır (exp=1).
-            dosyalar = resolve_person_files(args.dosya_klasor, belge_ad)
-            if not dosyalar and fold(belge_ad) != fold(name):
-                dosyalar = resolve_person_files(args.dosya_klasor, name)   # yedek: belge portal-adıyla adlandırılmış olabilir
-            if not dosyalar and args.dosya:
-                dosyalar = [args.dosya]                       # fallback: global tek dosya (verildiyse)
             if not dosyalar:
-                failed.add(fold(name)); log(f"!! {name} → klasörde belge bulunamadı, onaya GÖNDERİLMEDİ (elle yükle)"); close_form(); continue
+                failed.add(row_key); log(f"!! {name} → klasörde belge bulunamadı, onaya GÖNDERİLMEDİ (elle yükle)"); close_form(); continue
             # modaldaki GEÇERLİ (KB/MB var, Hata/Başarısız YOK) satır SAYISI — yükleme doğrulaması buradan (boolean değil sayım)
             count_rows = lambda: page.evaluate(r"""()=>{const m=[...document.querySelectorAll('.modal.in,.ui-dialog')].find(x=>x.offsetParent!==null && /Dosya Y[üu]kleme/i.test(x.innerText));
                 return m ? [...m.querySelectorAll('tr')].filter(tr=>/KB|MB/.test(tr.innerText) && !/Hata|Ba[şs]ar[ıi]s[ıi]z/i.test(tr.innerText)).length : 0;}""")
@@ -330,14 +498,20 @@ def main():
                 page.locator("a:has-text('Dosya Yükle'), button:has-text('Dosya Yükle')").filter(visible=True).first.click(timeout=4000)
                 page.wait_for_timeout(1200)
                 have = count_rows()
-                if have >= exp:
-                    log(f"  {name}: {have} belge zaten yüklü (≥{exp} beklenen) → yükleme atlandı")
-                elif have > 0:
-                    # kısmi durum (0<have<exp): hangi belge eksik bilinmiyor → çift-yükleme riski; güvenli taraf = elle
-                    failed.add(fold(name)); log(f"!! {name} → modalda {have}/{exp} belge var (KISMİ), karışmasın diye ATLANDI; elle tamamla"); close_form(); continue
+                if file_plan is not None:
+                    pending = pending_plan_files(page, dosyalar)
+                elif have >= exp:
+                    pending = []
+                elif have:
+                    raise RuntimeError(f"{have}/{exp} belge mevcut, eksikler dosya adıyla doğrulanamadı.")
                 else:
-                    # have == 0 → kişinin TÜM belgelerini sırayla yükle. Her biri: "+ Dosya Ekle" → 'yıllık izin formu' → set_input_files
-                    for i, fpath in enumerate(dosyalar, 1):
+                    pending = dosyalar
+                if not pending:
+                    log(f"  {name}: {have} belge zaten yüklü → yükleme atlandı")
+                else:
+                    for i, fpath in enumerate(pending, exp - len(pending) + 1):
+                        if file_plan is not None and fpath not in pending_plan_files(page, dosyalar):
+                            continue
                         sz_kb = os.path.getsize(fpath) / 1024
                         if sz_kb > 1024:
                             log(f"     ⚠️ {os.path.basename(fpath)} {sz_kb:.0f} KB > 1 MB — portal reddedebilir")
@@ -396,18 +570,22 @@ def main():
                             raise RuntimeError(f"belge {i}/{exp} '{os.path.basename(fpath)}' yüklenemedi (satır artmadı/Hata)")
                         log(f"     ✓ {os.path.basename(fpath)} ({i}/{exp})")
                 final = count_rows()
+                if file_plan is not None and pending_plan_files(page, dosyalar):
+                    raise RuntimeError("Yüklenen PDF'ler kişi için seçilen dosyaların tamamıyla eşleşmedi.")
                 page.evaluate(r"""()=>{const m=[...document.querySelectorAll('.modal.in,.ui-dialog')].find(x=>x.offsetParent!==null && /Dosya Y[üu]kleme/i.test(x.innerText));
                     if(m){const c=m.querySelector('.close,.ui-dialog-titlebar-close,.fa-times,button.close'); if(c)c.click();}}""")
                 page.wait_for_timeout(900)
                 if final < exp:
-                    failed.add(fold(name)); log(f"!! {name} → {final}/{exp} belge yüklendi (EKSİK), onaya gönderilmedi; elle bak"); close_form(); continue
+                    failed.add(row_key); log(f"!! {name} → {final}/{exp} belge yüklendi (EKSİK), onaya gönderilmedi; elle bak"); close_form(); continue
                 log(f"  {name}: {final}/{exp} belge yüklendi ✓")
             except Exception as e:
-                failed.add(fold(name)); log(f"!! {name} → Dosya Yükle hatası ({str(e)[:60]}), atlandı"); close_form(); continue
+                failed.add(row_key); log(f"!! {name} → Dosya Yükle hatası ({str(e)[:60]}), atlandı"); close_form(); continue
             wait_ajax(page)
             # 🧪 SADECE-YÜKLE test modu: belgeler yüklendi → ONAYA GÖNDERME (geri-alınamaz onayı atla, taslak kalsın)
             if args.sadece_yukle:
                 ok += 1
+                processed.add(row_key)
+                processed_plan_keys.add(plan_key)
                 log(f"[{ok}] {name} → SADECE-YÜKLE ✓ ({len(dosyalar)} belge yüklü, ONAYA GÖNDERİLMEDİ); modalda gözle/temizle")
                 close_form()
                 continue
@@ -444,26 +622,35 @@ def main():
             #   close_form filtreyi sıfırlayabilir → her okumada reset_list_filter+Listele; satır güncellenene dek kısa poll.
             #   BAŞARI = durum 'Gönderilmemiş' DEĞİL (yani Bekleyen/Gönderilmiş/Onaylanmış'a geçmiş). Self-verifying — ayrı check_status gerekmez.
             durum = None
+            sent_states = {"Yönetici Şirket Tarafından Onaylanmış", "Değerlendirme Bekleyen",
+                           "Değerlendirmeye Gönderilmiş", "Onaylanmış", "İmzalanmış"}
             for _v in range(6):
                 if not list_open():
                     open_list()
                 else:
                     reset_list_filter()
                 listele()
-                durum = page.evaluate(STATUS_OF, fold(name))
-                if durum and "Gönderilmemiş" not in durum:
+                durum = page.evaluate(STATUS_OF, [fold(name), tcKey])
+                if durum in sent_states:
                     break
                 page.wait_for_timeout(600)
-            if not (durum and "Gönderilmemiş" not in durum):
-                failed.add(fold(name))
+            if durum not in sent_states:
+                failed.add(row_key)
                 log(f"!! {name} → ONAYA GİTMEDİ (durum: {durum or 'okunamadı/taslak'}); elle bak")
                 continue
             ok += 1
+            processed.add(row_key)
+            processed_plan_keys.add(plan_key)
             with open(onay_file, "a", encoding="utf-8") as f:
                 f.write(belge_ad + "\n")   # Excel/DGS adı → resume+onaylanan `our` (Excel isimleri) ile eşleşsin
             log(f"[{ok}] {name} → ONAYA GÖNDERİLDİ ✓ (gerçek durum: {durum})")
 
         log(f"\n==== ÖZET: bu koşuda {ok} kişi onaya gönderildi ====")
+        if file_plan is not None and ok < limit:
+            pending = [row["ad"] for key, row in file_plan.items()
+                       if key not in processed_plan_keys and fold(row["ad"]) not in onaylanan]
+            if pending:
+                log("  Bu koşuda işlem doğrulanamayan çalışanlar: " + ", ".join(pending))
         if failed:
             log(f"  !! ONAYA GİTMEYEN ({len(failed)}): elle bak.")
         try:

@@ -16,7 +16,15 @@ on:
     paths:
       - 'Codes/**'
       - '.github/workflows/build-windows.yml'
-  workflow_dispatch:        # Actions sekmesinden elle de başlatılabilir ("Run workflow")
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Test edilen Windows EXE dosyasını GitHub Release olarak yayımla
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -48,11 +56,11 @@ jobs:
           print('SURUM =', m.group(1) if m else 'BULUNAMADI')
         # Bu satır koşu log'una düşer → indirilen exe'nin hangi koda karşılık geldiği kayda geçer.
 
-      - name: Dijitalpark veri, şirket ve kişi mutabakatı testleri
+      - name: Windows kaynak ve izin belgesi testleri
         working-directory: Codes
         env:
           PYTHONIOENCODING: utf-8
-        run: python -m unittest -q test_dijitalpark test_dgs_kapanis test_dgs_onaya test_portal_tenant
+        run: python -m unittest discover -v
 
       - name: Derle
         working-directory: Codes
@@ -172,7 +180,17 @@ jobs:
               if result.returncode:
                   raise RuntimeError(result.stdout + result.stderr)
               assert '1 kişi' in result.stdout and 'yalnız taslak' in result.stdout, result.stdout
-              print('PASS: derlenmiş exe Dijitalpark DGS ve izin taslaklarını okudu')
+              forms = pathlib.Path(temp) / 'Çalışan İzinleri'
+              folder = forms / 'Örnek Kişi'
+              folder.mkdir(parents=True)
+              (folder / 'Yıllık İzin Formu.pdf').write_bytes(b'%PDF-1.4\n%%EOF')
+              result = subprocess.run([str(exe), 'orchestrator', '--excel', str(izin_path),
+                                       '--park', 'DIJITALPARK', '--kisi-belge-klasoru', str(forms),
+                                       '--plan'], cwd=temp, capture_output=True, text=True,
+                                      encoding='utf-8', errors='replace', timeout=60)
+              assert result.returncode == 0, result.stdout + result.stderr
+              assert '1/1' in result.stdout and str(pathlib.Path('Örnek Kişi/Yıllık İzin Formu.pdf')) in result.stdout, result.stdout
+              print('PASS: Windows EXE Türkçe alt klasördeki doğru izin PDF dosyasını eşleştirdi')
 
       - uses: actions/upload-artifact@v4
         with:
@@ -180,3 +198,51 @@ jobs:
           path: 'Codes/dist/Etkin Otomasyon.exe'
           if-no-files-found: error   # sessizce boş artifact bırakma
           retention-days: 30
+
+  publish:
+    name: Windows sürümünü yayımla
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: publish-windows-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Etkin-Otomasyon-exe
+          path: release-dist
+      - name: Doğrulanan EXE'yi ve SHA-256 özetini yayımla
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^SURUM = "([0-9]{4}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?)".*/\1/p' Codes/izin_gui.py)
+          [[ -n "$version" ]]
+          tag="v${version//-/.}"
+          asset=release-dist/Etkin-Otomasyon.exe
+          mv 'release-dist/Etkin Otomasyon.exe' "$asset"
+          (cd release-dist && sha256sum Etkin-Otomasyon.exe > SHA256SUMS.txt)
+          git fetch --no-tags origin main
+          [[ "$(git rev-parse FETCH_HEAD)" == "$GITHUB_SHA" ]] || { echo 'main güncellendi; yeni sürüm için iş akışını yeniden çalıştırın.'; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            echo "Bu etiket zaten var: $tag"; exit 1
+          else
+            [[ $? == 2 ]] || exit 1
+          fi
+          cp "$asset" 'Etkin Otomasyon.exe'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f -- 'Etkin Otomasyon.exe'
+          git commit -m "build(windows): $version EXE dosyasını güncelle"
+          git tag "$tag"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$tag"
+          gh release create "$tag" --verify-tag --latest \
+            --title "Etkin Otomasyon $version" --generate-notes \
+            "$asset" release-dist/SHA256SUMS.txt
+          size=$(stat -c %s "$asset")
+          digest="sha256:$(cut -d' ' -f1 release-dist/SHA256SUMS.txt)"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" | jq -e --arg digest "$digest" --argjson size "$size" \
+            '.assets | any(.name == "Etkin-Otomasyon.exe" and .size == $size and .digest == $digest)'
