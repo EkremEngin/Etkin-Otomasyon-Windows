@@ -118,7 +118,7 @@ jobs:
                       assert data['kisiler'][0]['ad'] == 'ÖRNEK ' + park, data
                       print(f'PASS: {title} / {park}, dönem ve personel eşleşti')
 
-      - name: Dijitalpark DGS ve izin taslakları — derlenmiş exe
+      - name: Dijitalpark DGS taslağı — derlenmiş exe
         working-directory: Codes
         shell: python
         env:
@@ -162,6 +162,22 @@ jobs:
                                             if k != 'DGS_EXPECTED_COMPANY'})
               assert blocked.returncode == 2 and 'beklenen tam firma unvanı' in blocked.stdout, blocked.stdout
 
+      - name: İzin belgeleri ve firma çalışan tablosu — derlenmiş exe
+        working-directory: Codes
+        shell: python
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          import datetime, json, os, pathlib, subprocess, sys, tempfile
+          from openpyxl import Workbook
+          exe = os.environ.get('YEREL_EXE', '').split('|') if os.environ.get('YEREL_EXE') else [str(pathlib.Path('dist/Etkin Otomasyon.exe').resolve())]
+          def run(*args, env=None):
+              r = subprocess.run(exe + list(args), cwd=temp, capture_output=True, text=True, encoding='utf-8',
+                                 errors='replace', timeout=120, env=env or os.environ)
+              assert r.returncode == 0, r.stdout + r.stderr
+              return r.stdout
+          with tempfile.TemporaryDirectory() as temp:
+              # Dijitalpark izin onayı 2026-11-24 canlıda belgesiz doğrulandı → plan 'PDF'siz, direkt' demeli.
               izin = Workbook()
               ws = izin.active
               ws.title = 'Tabelle1'
@@ -173,24 +189,51 @@ jobs:
               izin_path = pathlib.Path(temp) / 'dijitalpark-izin.xlsx'
               izin.save(izin_path)
               izin.close()
-              result = subprocess.run([str(exe), 'orchestrator', '--excel', str(izin_path),
-                                       '--parklar', 'DIJITALPARK', '--plan'], cwd=temp,
-                                      capture_output=True, text=True, encoding='utf-8',
-                                      errors='replace', timeout=60)
-              if result.returncode:
-                  raise RuntimeError(result.stdout + result.stderr)
-              assert '1 kişi' in result.stdout and 'yalnız taslak' in result.stdout, result.stdout
+              out = run('orchestrator', '--excel', str(izin_path), '--parklar', 'DIJITALPARK', '--plan')
+              assert '1 kişi' in out and "PDF'siz, direkt" in out, out
+              # Belge isteyen parkta (YTP): Türkçe alt klasör ve tek tek seçilen PDF listesi eşleşmeli.
+              ytp = Workbook()
+              ws = ytp.active
+              ws.append(['T.C.', 'Ad-Soyad', 'Tarih', 'Gün Sayısı', 'TGB'])
+              ws.append(['10000000146', 'Örnek Kişi', datetime.datetime(2026, 8, 13), 1, 'YTP'])
+              ytp_path = pathlib.Path(temp) / 'ytp-izin.xlsx'
+              ytp.save(ytp_path)
+              ytp.close()
               forms = pathlib.Path(temp) / 'Çalışan İzinleri'
               folder = forms / 'Örnek Kişi'
               folder.mkdir(parents=True)
               (folder / 'Yıllık İzin Formu.pdf').write_bytes(b'%PDF-1.4\n%%EOF')
-              result = subprocess.run([str(exe), 'orchestrator', '--excel', str(izin_path),
-                                       '--park', 'DIJITALPARK', '--kisi-belge-klasoru', str(forms),
-                                       '--plan'], cwd=temp, capture_output=True, text=True,
-                                      encoding='utf-8', errors='replace', timeout=60)
-              assert result.returncode == 0, result.stdout + result.stderr
-              assert '1/1' in result.stdout and str(pathlib.Path('Örnek Kişi/Yıllık İzin Formu.pdf')) in result.stdout, result.stdout
-              print('PASS: Windows EXE Türkçe alt klasördeki doğru izin PDF dosyasını eşleştirdi')
+              out = run('orchestrator', '--excel', str(ytp_path), '--park', 'YTP', '--kisi-belge-klasoru', str(forms), '--plan')
+              assert '1/1' in out and str(pathlib.Path('Örnek Kişi/Yıllık İzin Formu.pdf')) in out, out
+              secilen = pathlib.Path(temp) / 'Seçilen PDF'
+              secilen.mkdir()
+              (secilen / 'Örnek Kişi - Yıllık İzin.pdf').write_bytes(b'%PDF-1.4\n%%EOF')
+              (secilen / 'Başka Biri.pdf').write_bytes(b'%PDF-1.4\n%%EOF')
+              liste = pathlib.Path(temp) / 'secim.txt'
+              liste.write_text(str(secilen / 'Örnek Kişi - Yıllık İzin.pdf') + '\n', encoding='utf-8')
+              out = run('orchestrator', '--excel', str(ytp_path), '--park', 'YTP', '--kisi-belge-listesi', str(liste), '--plan')
+              assert '1/1' in out and 'Örnek Kişi - Yıllık İzin.pdf' in out and 'Başka Biri' not in out, out
+              print('PASS: Windows EXE Türkçe alt klasördeki ve tek tek seçilen izin PDF dosyalarını eşleştirdi')
+              # Firma çalışan tablosu (kişi başına izin aralıkları): DGS kişi listesi + izin planı.
+              firma = Workbook()
+              ws = firma.active
+              ws.append(['Sıra', 'Ad Soyad', 'Kimlik Numarası', 'ARGE Portal\nPersonel Tipi', 'İŞE GİRİŞ TARİHİ',
+                         'İŞTEN ÇIKIŞ TARİHİ', 'Başlangıç Tarihi', 'Bitiş Tarihi (İşe Başlama)',
+                         'İzin Kullanımı\nGün Sayısı', 'İzin Türü', 'İzin Toplam Gün'])
+              ws.append([1, 'ÖRNEK BİR', 10000000146, 'Yazılım Personeli', datetime.datetime(2024, 1, 22), None,
+                         datetime.datetime(2026, 10, 26), datetime.datetime(2026, 10, 27), 1, 'Yıllık İzin', 1])
+              ws.append([2, 'ÖRNEK İKİ', 10000000214, 'Yazılım Personeli', datetime.datetime(2024, 1, 22), None,
+                         datetime.datetime(2026, 10, 30), datetime.datetime(2026, 11, 2), 1, 'Sağlık İzni', 1])
+              firma_path = pathlib.Path(temp) / 'firma-tablosu.xlsx'
+              firma.save(firma_path)
+              firma.close()
+              out = run('dgs', '--park', 'Dijitalpark', 'liste', '--excel', str(firma_path), '--donem', 'EKİM 2026',
+                        env={**os.environ, 'DGS_EXPECTED_COMPANY': 'ÖRNEK PROJE A.Ş.'})
+              data = json.loads(out.split('<<<LISTE>>>', 1)[1])
+              assert data['park'] == 'Dijitalpark' and len(data['kisiler']) == 2, data
+              out = run('orchestrator', '--excel', str(firma_path), '--parklar', 'DIJITALPARK', '--plan')
+              assert '1 kişi' in out and 'ÖRNEK İKİ: 30.10.2026 Sağlık İzni' in out, out
+              print('PASS: Windows EXE firma çalışan tablosunu DGS ve izin için okudu; sağlık izni boş kaldı')
 
       - uses: actions/upload-artifact@v4
         with:
