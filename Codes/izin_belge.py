@@ -187,9 +187,12 @@ def find_belge_klasor(park, base: str | None = None) -> str | None:
     return None
 
 
-def readiness(people, folder: str | None, mode: str = PER_PERSON, ortak_belge: str | None = None) -> dict:
+def readiness(people, folder: str | None, mode: str = PER_PERSON, ortak_belge: str | None = None,
+              files=None) -> dict:
     """Kişi listesi + klasör → {matched{tc:[dosya]}, missing[person], extra[dosya], nonpdf[dosya], folder, mod, ortak, hata}.
-    mode=ORTAK → tek toplu belge TÜM kişilere eşleşir (çözülemezse herkes 'missing', sebep `hata`da)."""
+    mode=ORTAK → tek toplu belge TÜM kişilere eşleşir (çözülemezse herkes 'missing', sebep `hata`da).
+    files: kullanıcının TEK TEK seçtiği dosyalar (Windows'ta klasör penceresi PDF göstermiyor → çoklu dosya
+    seçimi). Verilirse klasör taranmaz; yalnız bu dosyalar, DOSYA ADINDAKİ isim/T.C. ile eşleştirilir."""
     folder = os.path.abspath(os.path.expanduser(folder)) if folder else None
     if mode == ORTAK:
         shared, hata = resolve_ortak_belge(folder, ortak_belge)
@@ -205,13 +208,25 @@ def readiness(people, folder: str | None, mode: str = PER_PERSON, ortak_belge: s
     people_by_key = {person_key(p.tc, p.ad): p for p in people}
     names = {key: f" {_words(p.ad)} " for key, p in people_by_key.items() if _words(p.ad)}
     matched, extra, ambiguous, nonpdf = {}, [], [], []
-    all_files = _list_files(folder, recursive=True)
-    pdf_stems = {os.path.normcase(os.path.splitext(f)[0]) for f in all_files
-                 if os.path.splitext(f)[1].lower() in _PDF_EXT}
-    for rel in all_files:
-        stem, ext = os.path.splitext(rel)
+    if files is not None:
+        # (gösterilen ad, tam yol, eşleşme bileşenleri): yalnız dosya adı — klasör adı kişiye işaret etmez.
+        entries = []
+        for f in files:
+            full = os.path.abspath(os.path.expanduser(str(f)))
+            if os.path.isfile(full):
+                entries.append((os.path.basename(full), full, [os.path.splitext(os.path.basename(full))[0]]))
+        try:
+            folder = os.path.commonpath([os.path.dirname(e[1]) for e in entries]) if entries else None
+        except ValueError:                       # Windows: farklı sürücüler ortak köke sahip değil
+            folder = os.path.dirname(entries[0][1])
+    else:
         # Tüm ad bir dosya veya klasör bileşeninde geçmeli (iki klasör bir adı oluşturamaz).
-        parts = stem.split(os.sep)
+        entries = [(rel, os.path.join(folder, rel), os.path.splitext(rel)[0].split(os.sep))
+                   for rel in _list_files(folder, recursive=True)]
+    pdf_stems = {os.path.normcase(os.path.splitext(rel)[0]) for rel, _full, _p in entries
+                 if os.path.splitext(rel)[1].lower() in _PDF_EXT}
+    for rel, full, parts in entries:
+        stem, ext = os.path.splitext(rel)
         owner, conflict = _owner(parts, people_by_key, names)
         if owner:
             file_words = f" {_words(parts[-1])} "
@@ -227,7 +242,7 @@ def readiness(people, folder: str | None, mode: str = PER_PERSON, ortak_belge: s
         elif conflict:
             ambiguous.append(rel)
         elif owner:
-            matched.setdefault(owner, []).append(os.path.join(folder, rel))
+            matched.setdefault(owner, []).append(full)
         else:
             extra.append(rel)
     same_basename = []
@@ -241,7 +256,9 @@ def readiness(people, folder: str | None, mode: str = PER_PERSON, ortak_belge: s
             seen_names.add(name)
     missing = [p for p in people if person_key(p.tc, p.ad) not in matched]
     hata = ""
-    if not folder or not os.path.isdir(folder):
+    if files is not None and not entries:
+        hata = "Seçilen PDF dosyaları bulunamadı."
+    elif not folder or not os.path.isdir(folder):
         hata = "Belge klasörü bulunamadı."
     elif same_basename:
         hata = f"Aynı kişi için dosya adları aynı. PDF'leri farklı adlandırın: {', '.join(same_basename[:4])}"
@@ -258,8 +275,26 @@ def resolve_person_files(folder: str, ad: str, tc: str = "") -> list[str]:
     return r["matched"].get(person_key(tc, ad), [])
 
 
-def source_readiness(park, people, *, base=None, ortak_belge=None, kisi_klasoru=None):
+def dosya_listesi_oku(yol: str | None):
+    """GUI'nin yazdığı seçili-PDF listesi (UTF-8, satır başına bir yol). Yol verilmezse None."""
+    if not yol:
+        return None
+    with open(yol, encoding="utf-8-sig") as f:
+        return [s.strip() for s in f if s.strip()]
+
+
+def dosya_listesi_yaz(dosyalar, yol: str) -> str:
+    with open(yol, "w", encoding="utf-8") as f:
+        f.write("\n".join(dosyalar) + "\n")
+    return yol
+
+
+def source_readiness(park, people, *, base=None, ortak_belge=None, kisi_klasoru=None, kisi_dosyalari=None):
     """Plan, ekran ve yükleyici için aynı belge kaynağını çöz."""
+    if kisi_dosyalari is not None:
+        if ortak_belge or kisi_klasoru is not None or not park.belge_klasoru_destekli:
+            raise ValueError("Seçilen kişisel PDF'ler ortak PDF veya klasörle birlikte kullanılamaz.")
+        return readiness(people, None, mode=PER_PERSON, files=kisi_dosyalari)
     if kisi_klasoru is not None:
         if ortak_belge or not park.belge_klasoru_destekli:
             raise ValueError("Bu park veya ortak PDF seçimi kişi klasörüyle birlikte kullanılamaz.")
@@ -269,12 +304,13 @@ def source_readiness(park, people, *, base=None, ortak_belge=None, kisi_klasoru=
 
 
 def report(park, people, base: str | None = None, folder: str | None = None,
-           ortak_belge: str | None = None, kisi_klasoru: str | None = None) -> dict:
+           ortak_belge: str | None = None, kisi_klasoru: str | None = None, kisi_dosyalari=None) -> dict:
     """Parkın seçilen kaynağına göre belge hazırlık raporunu bas."""
-    if folder and kisi_klasoru is None:
+    if folder and kisi_klasoru is None and kisi_dosyalari is None:
         r = readiness(people, folder, mode=park.onay_pdf or PER_PERSON, ortak_belge=ortak_belge)
     else:
-        r = source_readiness(park, people, base=base, ortak_belge=ortak_belge, kisi_klasoru=kisi_klasoru)
+        r = source_readiness(park, people, base=base, ortak_belge=ortak_belge, kisi_klasoru=kisi_klasoru,
+                             kisi_dosyalari=kisi_dosyalari)
     mode, folder = r["mod"], r["folder"]
     etiket = "ORTAK tek belge" if mode == ORTAK else "kişi-başı belge"
     print(f"\n{LOG} {park.code} ({park.ad}) — {r['toplam']} kişi · mod: {etiket}")
@@ -326,6 +362,7 @@ def _main():
     ap.add_argument("--belge-klasor", default=None, help="Belge klasörü (yoksa Masaüstü konvansiyonu aranır)")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("--kisi-belge-klasoru", help="Kişi bazında izin formlarının aranacağı klasör ve alt klasörleri")
+    src.add_argument("--kisi-belge-listesi", help="Tek tek seçilmiş kişisel PDF'lerin listesi (satır başına bir yol)")
     src.add_argument("--ortak-belge", default=None,
                     help="ORTAK modlu parkta (İYTE) toplu belgenin yolu — klasör keşfini baypas eder")
     ap.add_argument("--base", default=None, help="Konvansiyon kök dizini (varsayılan ~/Desktop/İzin Belgeleri)")
@@ -342,7 +379,7 @@ def _main():
     if not people:
         print(f"{pk.code} için Excel'de kişi yok.", file=sys.stderr); sys.exit(0)
     r = report(pk, people, base=args.base, folder=args.belge_klasor, ortak_belge=args.ortak_belge,
-               kisi_klasoru=args.kisi_belge_klasoru)
+               kisi_klasoru=args.kisi_belge_klasoru, kisi_dosyalari=dosya_listesi_oku(args.kisi_belge_listesi))
     sys.exit(0 if r["hazir"] else 4)
 
 

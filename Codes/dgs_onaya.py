@@ -209,8 +209,12 @@ def read_list_rows(page) -> list[dict]:
 
 
 def _project_matches(row: dict, expected_projects: dict[str, str]) -> bool:
-    """Portal satırındaki proje, Excel'deki o kişinin projesiyle eşleşmeli."""
-    return row["ad_fold"] in expected_projects and fold(row["project"]) == expected_projects[row["ad_fold"]]
+    """Portal satırındaki proje, Excel'deki o kişinin projesiyle eşleşmeli.
+    Firma çalışan tablosunda proje sütunu yok (boş): girişte motor portaldaki TEK projeyi seçti → kişi eşleşmesi yeter."""
+    if row["ad_fold"] not in expected_projects:
+        return False
+    beklenen = expected_projects[row["ad_fold"]]
+    return beklenen == "" or fold(row["project"]) == beklenen
 
 
 def dblclick_row(page, ad_fold: str, project_fold: str) -> bool:
@@ -473,9 +477,11 @@ def main():
                 if st_after and "Gönderilmemiş" not in st_after:
                     break
                 page.wait_for_timeout(1000)
+            kota = D.uzaktan_kota_bandi(page) if (not st_after or "Gönderilmemiş" in st_after) else ""
             close_form_only(page)
             if not st_after or "Gönderilmemiş" in st_after:
-                failed.add(target["ad_fold"]); log(f"!! {ad}: onaya GİTMEDİ (statü={st_after!r}), atlandı")
+                sebep = f"UZAKTAN ÇALIŞMA KOTASI: {kota}" if kota else f"statü={st_after!r}"
+                failed.add(target["ad_fold"]); log(f"!! {ad}: onaya GİTMEDİ ({sebep}), atlandı")
                 continue
             ok += 1
             with open(onay_file, "a", encoding="utf-8") as f:

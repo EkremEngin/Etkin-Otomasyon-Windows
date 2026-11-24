@@ -202,6 +202,12 @@ class PersonRow:
     weekly_hours: int | None = None
     planned_dgs_min: int | None = None
     manual_dgs: bool = False
+    # Hak edilmiş (yıllık) izin OLMAYAN izin günleri (sağlık, doğum günü...): ne izin ne DGS girilir,
+    # gün boş kalır → teşvik dışı (kullanıcı kuralı 2026-11-24). Biçim: 'GG.AA.YYYY'.
+    bos_gunler: tuple[str, ...] = ()
+    # Firma tablosundaki portala girilmesi gereken (hak edilmiş) izin günleri. Grid'de o gün İZİN kaydı yoksa
+    # (girilememiş: PDKS çakışması vb.) DGS ile doldurulmaz → boş kalır, ELLE BAK (sahte DGS'ye karşı).
+    izin_gunleri: tuple[str, ...] = ()
 
 
 def _puantaj_sheet(wb, sheet: str):
@@ -280,8 +286,44 @@ def _duration_minutes(value, row_number: int, label: str) -> int:
     return minutes
 
 
+def _read_firma_tablosu(path: str, park_code: str | None) -> dict[str, PersonRow]:
+    """Firma çalışan tablosu (Ad Soyad, Kimlik Numarası, Personel Tipi + izin ARALIKLARI) → DGS kişileri.
+    Proje adı dosyada yok: CONFIG['proje_adi'] / DGS_PROJE ortam değişkeni, boşsa portaldaki TEK proje seçilir.
+    Hak edilmiş olmayan izin günleri (sağlık, doğum günü...) `bos_gunler` olur → o günlere DGS girilmez."""
+    import firma_izin_tablosu as F
+    if not park_code:
+        raise ValueError("Firma çalışan tablosu için park seçilmeli.")
+    label, _rx, ay_no = donem_label_and_regex(CONFIG.get("donem_text"))
+    kisiler = F.oku(path, int(label.split()[-1]), ay_no)
+    proje = (CONFIG.get("proje_adi") or os.environ.get("DGS_PROJE", "")).strip()
+    out: dict[str, PersonRow] = {}
+    for k in kisiler:
+        try:
+            sinif = F.ar_ge_sinifi(k.tip)
+        except F.TabloHatasi:
+            if "yeni" not in _fold_tr(k.tip):
+                raise ValueError(f"DGS satır {k.satir} ({k.ad}): personel tipi {k.tip!r} tanınmadı.") from None
+            sinif = "Ar-Ge"   # 'Yeni Giriş': portal tipi esas; Destek ise portal formu zaten gösterir
+            log(f"   (UYARI: {k.ad} tipi '{k.tip}' → Ar-Ge varsayıldı; portaldaki personel tipi esastır.)")
+        tesvik_disi = [g for g in k.izinler if not F.izin_girilir(k, g)]
+        # Yarım gün teşvik dışı izin yalnız ARİFEDE güvenli (çalışılan yarı izinli → tüm gün boş kalır).
+        if any(g.gun != 1 and F.gun_agirligi(g.tarih) != 0.5 for g in tesvik_disi):
+            raise ValueError(f"DGS satır {k.satir} ({k.ad}): yarım günlük teşvik dışı izin var — MANUEL.")
+        out[k.ad.upper()] = PersonRow(k.ad, proje, "", sinif, park_code, "", k.tc,
+                                      bos_gunler=tuple(g.tarih.strftime("%d.%m.%Y") for g in tesvik_disi),
+                                      izin_gunleri=tuple(g.tarih.strftime("%d.%m.%Y") for g in k.izinler
+                                                         if F.izin_girilir(k, g)))
+    bos_n = sum(1 for p in out.values() if p.bos_gunler)
+    log(f"Excel okundu (firma çalışan tablosu): {len(out)} personel, {bos_n} kişide teşvik dışı izin günü "
+        f"(boş kalacak) | proje: {proje or 'portaldaki tek proje'}")
+    return out
+
+
 def read_excel(path: str, sheet: str = "Mayıs", park_code: str | None = None) -> dict[str, PersonRow]:
     """Puantajı doğrulanmış başlıklardan oku; dosyayı ve dönem/resume anahtarını değiştirme."""
+    import firma_izin_tablosu
+    if firma_izin_tablosu.firma_tablosu_mu(path):
+        return _read_firma_tablosu(path, park_code)
     wb = load_workbook(path, data_only=True, read_only=True)
     out: dict[str, PersonRow] = {}
     seen_name_fold: set[str] = set()
@@ -488,7 +530,17 @@ def open_dgs_form(page: Page):
         if n == 0:
             break
     _open_menu_item(page, "Dışarıda Geçirilen Süreler Formu")
-    page.wait_for_selector('select#Donem_Id, select[name="Donem_Id"]', timeout=30_000)
+    try:
+        page.wait_for_selector('select#Donem_Id, select[name="Donem_Id"]', timeout=8_000)
+    except PWTimeout:
+        # 2026-11-24 canlı: önceki liste/onay işlemi 'Filtre' panelini KAPALI bıraktıysa Dönem select'i gizli
+        # kalıyor → her koşunun İLK kişisi 30 sn bekleyip düşüyordu. Paneli açıp tekrar bekle.
+        page.evaluate(
+            r"""()=>{const dlg=[...document.querySelectorAll('div.ui-dialog')].filter(d=>d.offsetParent!==null
+                   && /Listesi/.test(d.querySelector('.ui-dialog-titlebar')?.textContent||'')).pop();
+                 const b=dlg&&[...dlg.querySelectorAll('a,button')].find(x=>x.offsetParent!==null && /^Filtre$/.test(x.textContent.trim()));
+                 if(b) b.click();}""")
+        page.wait_for_selector('select#Donem_Id, select[name="Donem_Id"]', timeout=25_000)
     wait_for_form_idle(page)   # menü/form açılışı AJAX yükleme → bitene kadar bekle (kullanıcı uyarısı 2026-06-18)
     page.wait_for_timeout(700)
 
@@ -860,7 +912,7 @@ def select_personel(page: Page, ad_soyad: str, tc: str | None = None):
         page.wait_for_function(
             r"""(re)=>[...document.querySelectorAll('tr')].some(tr=>tr.children[2]
                   && new RegExp(re).test((tr.children[2].textContent||'').trim()))""",
-            arg=CONFIG["ay_regex"], timeout=12000)
+            arg=CONFIG["ay_regex"], timeout=CONFIG.get("grid_timeout_ms", 12000))
     except PWTimeout:
         raise VerifyError(f"Personel seçildi ama grid boş (gün satırı gelmedi): {ad_soyad}")
     wait_for_form_idle(page)
@@ -868,10 +920,38 @@ def select_personel(page: Page, ad_soyad: str, tc: str | None = None):
     log(f"  Personel seçildi+doğrulandı: {ad_soyad} (grid={n} gün)")
 
 
+def _tek_proje(page: Page) -> str:
+    """Formdaki Proje ▼ listesini aç; tam olarak bir seçenek varsa adını döndür, yoksa VerifyError."""
+    oku = lambda: page.evaluate(
+        r"""() => [...document.querySelectorAll('ul.ui-autocomplete li, ul.ui-menu li')]
+              .filter(li => li.offsetParent !== null)
+              .map(li => (li.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean)""")
+    combo = (page.locator("input[name='string_Proje_Id']:visible").last
+             .locator("xpath=following-sibling::a[contains(@class,'combo')]").first)
+    secenek, hata = [], None
+    for zorla in (False, True):          # canlı: tıklama zaman aşımına düşse de liste açılmış olabiliyor
+        try:
+            combo.click(timeout=5000, force=zorla)
+        except Exception as e:
+            hata = e
+        page.wait_for_timeout(1500)
+        secenek = oku()
+        if secenek:
+            break
+    if not secenek and hata:
+        raise VerifyError(f"Proje listesi açılamadı ({hata}); proje adını verin.")
+    if len(secenek) != 1:
+        raise VerifyError(f"Proje adı verilmedi ve portalda tek proje yok ({len(secenek)}: {secenek[:5]}). "
+                          "Proje adını girin.")
+    return secenek[0]
+
+
 def set_proje(page: Page, proje_adi: str):
-    """Proje seç + gizli Proje_Id'nin set olduğunu DOĞRULA. (En kritik adım!)"""
+    """Proje seç + gizli Proje_Id'nin set olduğunu DOĞRULA. (En kritik adım!)
+    Proje adı boşsa (firma çalışan tablosu): ▼ listede TEK proje varsa o seçilir; birden çoksa DUR."""
     if not proje_adi:
-        raise VerifyError("Excel'de proje adı boş.")
+        proje_adi = _tek_proje(page)
+        log(f"  Proje adı verilmedi → portaldaki tek proje: {proje_adi}")
     # benzersiz, ayırt edici bir substring seç (ortadan ~40 karakter yeterli; 'contains' filtresi)
     needle = proje_adi.strip()
     typed = needle[:40]
@@ -924,22 +1004,23 @@ def wait_for_form_idle(page: Page, timeout: int = 20000, settle: int = 80):
     page.wait_for_timeout(settle)   # panel kaybolduktan sonra küçük DOM-render tamponu (proje-reload çağrısı settle'ı yükseltir)
 
 
-def tick_clean_days(page: Page) -> int:
+def tick_clean_days(page: Page, skip: tuple[str, ...] = ()) -> int:
     """SADECE TEMİZ günleri tikle: kesin (PDKS, td[17]) değeri OLMAYAN, aktif, tiksiz satırlar.
     KRİTİK BULGU (2026-06-17): bazı PDKS günleri (örn. içeride çok düşükse) checkbox'ı ENABLED gelir;
     'disabled değilse tikle' demek o PDKS gününü yanlışça 9h clean gibi tikler. Ayrım `kesin` ile yapılır.
-    (Proje seçili OLMALI — yoksa tikler İstenilen'e saymaz.)"""
+    (Proje seçili OLMALI — yoksa tikler İstenilen'e saymaz.) `skip`: boş kalacak günler (tiklenmez)."""
     n = page.evaluate(
-        r"""(re) => {
+        r"""({re, skip}) => {
           const rx=new RegExp(re); let count=0;
           document.querySelectorAll('tr').forEach(tr=>{const td=tr.children; if(td.length<18) return;
             const t=(td[2]?.textContent||'').trim(); if(!rx.test(t)) return;
+            if(skip.includes(t)) return;                            // teşvik dışı izin günü → boş kalır
             const kesin=(td[17]?.textContent||'').trim();           // PDKS/izin/yarım-tatil → atla
             const ac=(td[12]?.textContent||'').trim();              // açıklamalı gün (Pdks/İzin/tatil) → atla
             const cb=tr.querySelector('input[type=checkbox][name^="module_update_"]');
             if(cb && !cb.disabled && !cb.checked && cb.offsetParent!==null && !kesin && !ac){ cb.click(); count++; }});
           return count;
-        }""", CONFIG["ay_regex"])
+        }""", {"re": CONFIG["ay_regex"], "skip": list(skip)})
     # tuttu mu? (sadece temiz günlerin sayısı kadar tikli olmalı)
     after = read_grid_rows(page)
     clean_checked = [r for r in after if r["checked"] and not r["kesin"]]
@@ -958,7 +1039,7 @@ def _open_edit(page: Page, tarih: str) -> bool:
     return ok
 
 
-def _read_dialog(page: Page, tarih: str, expected_inside_min: int):
+def _read_dialog(page: Page, tarih: str, expected_inside_min: int, require_stamp: bool = False):
     """STALE guard (KRİTİK — canlı 2026-06-17/18 bulgusu): ✎ açınca tarih input'u Kesinleşmiş tablodan
     ÖNCE güncelleniyor → yalnız tarih+toplam'a bakmak STALE veriyi geçirebiliyor. FELAKET ÖRNEĞİ (ABDULBAKİ
     21↔22.05): iki günün içeride TOPLAMI tesadüfen eşit (8:45) ama aralıkları farklı → 22'yi açınca 21'in
@@ -973,22 +1054,30 @@ def _read_dialog(page: Page, tarih: str, expected_inside_min: int):
         const xs=[...document.querySelectorAll('input')].filter(i=>i.offsetParent!==null && /^\d{2}\.\d{2}\.\d{4}$/.test((i.value||'').trim()));
         if(xs.length!==1 || xs[0].value.trim()!==d.tarih) return false;
         // PDKS damgaları VARSA hepsi hedef tarihli olmalı (izin gününde hiç damga olmayabilir → izinli OK)
-        let foreign=false;
+        let foreign=false; const stampTimes=new Set();
         document.querySelectorAll('tr').forEach(tr=>{const t=tr.innerText.replace(/\s+/g,' ').trim();
-          const m=t.match(/^(\d{2}\.\d{2}\.\d{4})\s+\d{2}:\d{2}\s+\S+\s+(PDKS|Manuel|Elle)/);
-          if(m && m[1]!==d.tarih) foreign=true;});
+          const m=t.match(/^(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\s+\S+\s+(PDKS|Manuel|Elle)/);
+          if(m && m[1]!==d.tarih) foreign=true;
+          if(m && m[1]===d.tarih) stampTimes.add(m[2]);});
         if(foreign) return false;                             // başka güne ait damga → STALE
+        // 2026-11-24 (Dijitalpark canlı): damga tablosu bir an BOŞ kalırken aralıklar hâlâ ÖNCEKİ günün
+        // (iki günün toplamı tesadüfen eşit 07:37) → eski kontrol geçiyordu, yanlış saatle çakışma yapıldı.
+        // PDKS gününde: hedef tarihli damga GÖRÜNMELİ ve her PDKS aralığının başı/sonu bu damgalarda olmalı.
+        if(d.stamp && stampTimes.size===0) return false;
         // kesinleşmiş aralık toplamı == kesin (TÜM türler: PDKS, Ücretli, ...)
-        const ivs=[];
+        const ivs=[]; let ivForeign=false;
         document.querySelectorAll('tr').forEach(tr=>{const t=tr.innerText.replace(/\s+/g,' ').trim();
-          const m=t.match(/^(\d{2}:\d{2})\s+(\d{2}:\d{2})\s+\d{2}:\d{2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]/);
-          if(m)ivs.push([m[1],m[2]]);});
+          const m=t.match(/^(\d{2}:\d{2})\s+(\d{2}:\d{2})\s+\d{2}:\d{2}\s+([A-Za-zÇĞİÖŞÜçğıöşü]+)/);
+          if(m){ivs.push([m[1],m[2]]);
+            if(d.stamp && m[3]==='PDKS' && !(stampTimes.has(m[1]) && stampTimes.has(m[2]))) ivForeign=true;}});
+        if(ivForeign) return false;                           // aralık bu günün damgalarından değil → STALE
         const toMin=t=>{const mm=/^(\d{1,2}):(\d{2})$/.exec(t);return +mm[1]*60+ +mm[2];};
         const sum=ivs.reduce((s,[a,b])=>s+(toMin(b)-toMin(a)),0);
         return ivs.length>0 && sum===d.inside;
     }"""
     try:
-        page.wait_for_function(js, arg={"tarih": tarih, "inside": expected_inside_min}, timeout=8000)
+        page.wait_for_function(js, arg={"tarih": tarih, "inside": expected_inside_min, "stamp": require_stamp},
+                               timeout=CONFIG.get("dialog_timeout_ms", 8000))
     except PWTimeout:
         raise VerifyError(f"{tarih}: taze dialog gelmedi (STALE korundu — damga tarihi/toplam {to_hhmm(expected_inside_min)} ile eşleşmedi).")
     s = page.evaluate(
@@ -1097,6 +1186,131 @@ def _ekrani_temizle(page: Page):
         pass
 
 
+# ----------------------------------------------------------------------------
+# HATA ANI DÖKÜMÜ (2026-11-24, kullanıcı açıkça istedi) — YALNIZ EK, akışa dokunmaz.
+# Kişi patlayınca ekran görüntüsünün yanına: sayfanın tam DOM'u (.dom.html) + "ekranda ne açık"
+# özeti ve son konsol/ağ olayları (.durum.json). DGS_TRACE=1 ise ayrıca kişi başı Playwright
+# trace'i (.trace.zip; yalnız HATALI kişininki diske yazılır, başarılınınki atılır).
+# Hiçbiri exception sızdırmaz. Dosyalarda ad/T.C. olabilir → ekran görüntüleri gibi yerelde kalır.
+# ----------------------------------------------------------------------------
+_KAYIT = {"konsol": None, "ag": None, "iz_ctx": None, "iz_chunk": False}
+
+_DURUM_JS = r"""() => {
+  const gor = e => { const s = getComputedStyle(e);
+    return s.display !== 'none' && s.visibility !== 'hidden' && (e.offsetWidth > 0 || e.offsetHeight > 0); };
+  const tarif = e => e ? { etiket: e.tagName.toLowerCase(), id: e.id || null,
+    sinif: String(e.className || '').slice(0, 80), z: getComputedStyle(e).zIndex,
+    metin: String(e.innerText || e.value || '').trim().replace(/\s+/g, ' ').slice(0, 160) } : null;
+  const bul = sel => [...document.querySelectorAll(sel)].filter(gor).map(tarif);
+  const ustte = [...document.querySelectorAll('body *')].map(e => [e, getComputedStyle(e)])
+    .filter(([e, s]) => s.position !== 'static' && s.zIndex !== 'auto' && gor(e))
+    .sort((a, b) => (+b[1].zIndex || 0) - (+a[1].zIndex || 0)).slice(0, 6).map(([e]) => tarif(e));
+  return { url: location.href, baslik: document.title, readyState: document.readyState,
+    ekran_ortasindaki: tarif(document.elementFromPoint(innerWidth / 2, innerHeight / 2)),
+    odaktaki: tarif(document.activeElement),
+    diyaloglar: bul('.ui-dialog'), modallar: bul('.modal, .modal-backdrop'),
+    sweetalert: bul('.sweet-alert, .sweet-overlay'), yukleniyor: bul('.form_loading_panel, .pReload.loading'),
+    acik_menuler: bul('[id^="menu-folder-"]'), en_ustteki_katmanlar: ustte };
+}"""
+
+
+def _hata_kaydedici_kur(page: Page):
+    """Son 40 konsol mesajını + son 40 XHR/belge/hatalı ağ isteğini halka-tamponda tut (gövde YOK,
+    URL'nin ? sonrası atılır). DGS_TRACE=1 ise context trace'ini başlat. Patlarsa sadece uyarır."""
+    try:
+        from collections import deque
+        konsol, ag = deque(maxlen=40), deque(maxlen=40)
+
+        def _k(m):
+            try: konsol.append(f"{datetime.datetime.now():%H:%M:%S} [{m.type}] {m.text[:300]}")
+            except Exception: pass
+
+        def _r(resp):
+            try:
+                req = resp.request
+                if req.resource_type in ("xhr", "fetch", "document") or resp.status >= 400:
+                    ag.append(f"{datetime.datetime.now():%H:%M:%S} {req.method} {resp.status} "
+                              f"{resp.url.split('?', 1)[0][:200]}")
+            except Exception: pass
+
+        def _f(req):
+            try: ag.append(f"{datetime.datetime.now():%H:%M:%S} {req.method} BAŞARISIZ({req.failure}) "
+                           f"{req.url.split('?', 1)[0][:200]}")
+            except Exception: pass
+
+        page.on("console", _k); page.on("response", _r); page.on("requestfailed", _f)
+        _KAYIT["konsol"], _KAYIT["ag"] = konsol, ag
+        if os.environ.get("DGS_TRACE") == "1":
+            page.context.tracing.start(screenshots=True, snapshots=True)
+            _KAYIT["iz_ctx"] = page.context
+            log("DGS_TRACE=1: kişi başı trace açık (yalnız HATALI kişininki .trace.zip olarak yazılır).")
+    except Exception as e:
+        log(f"(uyarı) hata kaydedici kurulamadı: {e}")
+
+
+def _iz_kisi_basla():
+    """DGS_TRACE=1 ise bu kişi için yeni trace parçası aç."""
+    if _KAYIT["iz_ctx"] is None:
+        return
+    try:
+        _iz_kisi_bitir()   # önceki kişiden açık kalan parça varsa at
+        _KAYIT["iz_ctx"].tracing.start_chunk()
+        _KAYIT["iz_chunk"] = True
+    except Exception as e:
+        log(f"(uyarı) trace başlatılamadı, kapatıldı: {e}")
+        _KAYIT["iz_ctx"] = None
+
+
+def _iz_kisi_bitir(yol: str | None = None):
+    """Açık trace parçasını kapat: yol verilirse (hatalı kişi) diske yaz, verilmezse at."""
+    if _KAYIT["iz_ctx"] is None or not _KAYIT["iz_chunk"]:
+        return None
+    _KAYIT["iz_chunk"] = False
+    try:
+        if yol:
+            _KAYIT["iz_ctx"].tracing.stop_chunk(path=yol)
+        else:
+            _KAYIT["iz_ctx"].tracing.stop_chunk()
+        return yol
+    except Exception as e:
+        log(f"(uyarı) trace yazılamadı: {e}")
+        return None
+
+
+def _hata_dokumu(page: Page, shot: str):
+    """Ekran görüntüsünün yanına DOM + durum özeti (+ trace) yaz. Ekran görüntüsünden SONRA,
+    _ekrani_temizle'den ÖNCE çağrılır (kanıt temizlenmeden). Kişi mesajına DOKUNMAZ (GUI '(ss:' ile
+    ayrıştırıyor); yazılanları ayrı log satırında söyler. Asla exception sızdırmaz."""
+    import json
+    kok = shot.rsplit(".", 1)[0]
+    yazilan = []
+    try:
+        html = page.content()   # önce oku: sayfa ölüyse boş dosya bırakma
+        with open(kok + ".dom.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        yazilan.append(kok + ".dom.html")
+    except Exception:
+        pass
+    try:
+        durum = {"zaman": datetime.datetime.now().isoformat(timespec="seconds")}
+        try:
+            durum.update(page.evaluate(_DURUM_JS))
+        except Exception as e:
+            durum["durum_okunamadi"] = str(e)[:300]
+        durum["son_konsol"] = list(_KAYIT["konsol"] or [])
+        durum["son_ag"] = list(_KAYIT["ag"] or [])
+        with open(kok + ".durum.json", "w", encoding="utf-8") as f:
+            json.dump(durum, f, ensure_ascii=False, indent=1)
+        yazilan.append(kok + ".durum.json")
+    except Exception:
+        pass
+    iz = _iz_kisi_bitir(kok + ".trace.zip")
+    if iz:
+        yazilan.append(iz)
+    if yazilan:
+        log("  (hata dökümü: " + ", ".join(yazilan) + ")")
+
+
 def _dialog_save(page: Page):
     """Dialog 'Kaydet' (F3'süz) — gerçek+JS click DÖNÜŞÜMLÜ, kapanana kadar POLL (buton tıklaması flaky).
     Çakışma/hata SweetAlert'i ('pdks kaydı mevcuttur' vb.) çıkarsa KAPAT + net halt (sonraki kişiyi bloklamaz)."""
@@ -1153,7 +1367,8 @@ def process_pdks_day(page: Page, tarih: str, target: int) -> str:
         return "icaride>=hedef"
     if not _open_edit(page, tarih):
         raise VerifyError(f"{tarih}: ✎ ikonu bulunamadı.")
-    intervals = _read_dialog(page, tarih, expected_inside)   # çapraz-kontrol: aralık toplamı == kesin
+    damga_sart = bool(CONFIG.get("pdks_damga_kontrol")) and "pdks" in (row0["aciklama"] or "").lower()
+    intervals = _read_dialog(page, tarih, expected_inside, damga_sart)   # çapraz-kontrol: aralık toplamı == kesin
     inside = sum(b - a for a, b in intervals)                # == expected_inside (STALE değil)
     need = target - inside
     if need <= 0:
@@ -1196,6 +1411,41 @@ def process_pdks_day(page: Page, tarih: str, target: int) -> str:
     return "ok"
 
 
+def _arife_kilitli_tamamla(page: Page, tarih: str, kesin: int, half_target: int):
+    """KİLİTLİ arife satırı + içeride (PDKS) yarım günden AZ (2026-11-24 Dijitalpark canlı: SGK raporunda
+    istisnalı 184:11/183:16 → GV Gün 29,96/29,86). Portal içerideki PDKS'i sayıyor ('Önerilen Süre' =
+    gereken − içeride); eksik = yarım gün − içeride, PDKS gününde olduğu gibi çakışmasız DIŞARIDA girilir."""
+    if not _open_edit(page, tarih):
+        raise VerifyError(f"{tarih}: kilitli arife ✎ ikonu bulunamadı.")
+    intervals = _read_dialog(page, tarih, kesin, bool(CONFIG.get("pdks_damga_kontrol")))
+    inside = sum(b - a for a, b in intervals)
+    need = half_target - inside
+    if need <= 0:
+        _close_dialog_hard(page)
+        return "atla", 0
+    last = max(b for _, b in intervals)
+    start, end = place_outside(need, intervals, to_hhmm(last + CONFIG["slot_margin"]), margin=CONFIG["slot_margin"])
+    for a, b in intervals:
+        if not (end <= a or start >= b):
+            raise VerifyError(f"{tarih}: kilitli arife penceresi kartla çakışıyor!")
+    _set_dialog_time(page, start, end)
+    _dialog_save(page)
+    row = next((r for r in read_grid_rows(page) if r["tarih"] == tarih), None)
+    if not row or row["toplam"] != to_hhmm(need):
+        raise VerifyError(f"{tarih}: kilitli arife satır toplam {row['toplam'] if row else '?'} != {to_hhmm(need)}")
+    page.evaluate(
+        r"""(d) => {const r=[...document.querySelectorAll('tr')].find(tr=>tr.children[2]&&tr.children[2].textContent.trim()===d);
+              const cb=r.querySelector('input[type=checkbox]'); if(cb&&!cb.disabled&&!cb.checked)cb.click();}""", tarih)
+    chk = page.evaluate(
+        r"""(d) => {const r=[...document.querySelectorAll('tr')].find(tr=>tr.children[2]&&tr.children[2].textContent.trim()===d);
+              const cb=r.querySelector('input[type=checkbox]'); return cb?cb.checked:false;}""", tarih)
+    if not chk:
+        raise VerifyError(f"{tarih}: kilitli arife doldurulduktan sonra tiklenemedi.")
+    log(f"  {tarih}: arifesi KİLİTLİ, içeride {to_hhmm(inside)} < {to_hhmm(half_target)} → dışarıda "
+        f"{to_hhmm(need)} ({to_hhmm(start)}-{to_hhmm(end)}) = {to_hhmm(half_target)} ✓")
+    return "ok", need
+
+
 def process_arife_day(page: Page, tarih: str, half_target: int):
     """Kurban arifesi (yarım gün resmi tatil). KULLANICI KURALI (2026-06-18): çalışılan yarı = half_target
     (9h kişi → 4:30) DIŞARIDA girilir; diğer yarı otomatik resmi tatil.
@@ -1208,6 +1458,9 @@ def process_arife_day(page: Page, tarih: str, half_target: int):
     if not row0:
         raise VerifyError(f"{tarih}: arifesi satırı bulunamadı.")
     if row0["disabled"]:
+        kesin = to_min(row0["kesin"]) if row0["kesin"] else 0
+        if CONFIG.get("arife_kilitli_tamamla") and 0 < kesin < half_target:
+            return _arife_kilitli_tamamla(page, tarih, kesin, half_target)
         log(f"  {tarih}: arifesi (badge ile hallolmuş, kesin={row0['kesin'] or '-'}) → atlandı")
         return "atla", 0
     if not _open_edit(page, tarih):
@@ -1414,7 +1667,22 @@ def onaya_gonder_in_form(page) -> str:
     if sa:   # 'dilekçe zorunlu' / çakışma vb. → taslak duruyor, halt
         _dismiss_sweetalert(page)
         raise VerifyError(f"Onaya Gönder reddedildi (portal): {sa[:80]}")
+    kota = uzaktan_kota_bandi(page)
+    if kota:   # 2026-11-24 Dijitalpark: firma geneli 10766 uzaktan çalışma kotası doldu → elle karar
+        raise VerifyError(f"Onaya gitmedi — UZAKTAN ÇALIŞMA KOTASI: {kota} (taslak duruyor, firma kararı gerekir).")
     raise VerifyError(f"Onaya gitmedi (statü taslakta kaldı: {st!r}).")
+
+
+def uzaktan_kota_bandi(page: Page) -> str:
+    """Formda 'Kanun kapsamında uzaktan çalışma için kullanabileceğiniz kalan süre X saattir...' uyarısı varsa
+    metnini döndür (yalnız 'Onaya Gönder' sonrası çıkıyor; kalan süre firma geneli). Yoksa ''."""
+    try:
+        return page.evaluate(
+            r"""() => {const t=[...document.querySelectorAll('div.ui-dialog')].filter(d=>d.offsetParent!==null)
+                   .map(d=>d.innerText.replace(/\s+/g,' ')).join(' ');
+                 const m=t.match(/kullanabileceğiniz kalan süre\s*\d{1,4}:\d{2}\s*saattir/i); return m?m[0]:'';}""")
+    except Exception:
+        return ""
 
 
 def process_one_person(page: Page, person: PersonRow, first: bool, sched_map: dict) -> dict:
@@ -1479,6 +1747,23 @@ def process_one_person(page: Page, person: PersonRow, first: bool, sched_map: di
     log(f"  Grid: {len(rows)} gün | temiz={len(temiz)} pdks={len(pdks)} arife={len(arife)} "
         f"atla(izin/tatil)={len(skip)} | hedef={to_hhmm(daily_target)}/gün cmt={include_sat}")
 
+    # TEŞVİK DIŞI İZİN GÜNLERİ (sağlık, doğum günü...): ne tiklenir ne doldurulur — gün BOŞ kalır.
+    bos = set(person.bos_gunler)
+    # Arifede yarım izin satırda 'izin' yazmıyor (açıklama arife); içeride (kesin) yarım günü dolduruyorsa izin VAR.
+    izin_var = lambda r: "izin" in a(r) or (is_arife(r) and bool(r["kesin"])
+                                           and to_min(r["kesin"]) >= daily_target // 2)
+    girilmemis_izin = sorted(r["tarih"] for r in rows
+                             if r["tarih"] in set(person.izin_gunleri) and not izin_var(r))
+    if girilmemis_izin:
+        log(f"  ⚠ ELLE BAK: Excel'de izinli ama portalda İZİN kaydı yok {girilmemis_izin} → DGS girilmeyecek, boş kalacak.")
+        bos |= set(girilmemis_izin)
+    if bos:
+        grid_tarih = {r["tarih"] for r in rows}
+        pdks = [r for r in pdks if r["tarih"] not in bos]
+        arife = [r for r in arife if r["tarih"] not in bos]
+        log(f"  BOŞ bırakılacak (hak edilmiş izin değil → teşvik dışı): {sorted(bos)}"
+            + (f" | grid'de olmayan: {sorted(bos - grid_tarih)}" if bos - grid_tarih else ""))
+
     # ÇAPRAZ KONTROL: temiz gün varsayılan toplamı, programdan türetilen günlük hedefle uyuşmalı.
     # (Uymazsa program/grid çelişkisi var → yanlış girmektense DUR.)
     defs = {r["toplam"] for r in temiz if r["toplam"]}
@@ -1487,7 +1772,11 @@ def process_one_person(page: Page, person: PersonRow, first: bool, sched_map: di
                           f"{to_hhmm(daily_target)} — program/grid uyuşmazlığı, MANUEL.")
 
     # temiz günler (proje seçili olduğu için tutar)
-    n_clean = tick_clean_days(page)
+    n_clean = tick_clean_days(page, tuple(sorted(bos)))
+    if bos:
+        dolu = [r["tarih"] for r in read_grid_rows(page) if r["tarih"] in bos and r["checked"]]
+        if dolu:
+            raise VerifyError(f"{person.ad_soyad}: boş kalması gereken gün(ler) tikli geldi {dolu} — MANUEL.")
     expected = n_clean * daily_target
 
     # PDKS günleri (kişi-bazında hedefle)
@@ -1514,7 +1803,18 @@ def process_one_person(page: Page, person: PersonRow, first: bool, sched_map: di
     if person.planned_dgs_min is not None and expected != person.planned_dgs_min:
         raise VerifyError(f"Excel P={to_hhmm(person.planned_dgs_min)}, portalda hesaplanan DGS="
                           f"{to_hhmm(expected)}. Yanlış süre kaydedilmesin diye durdu.")
-    log(f"  KONTROL: tikli={len(ticked)} | İstenilen={istenilen} (beklenen {to_hhmm(expected)}) ✓")
+    # Bilgi amaçlı: portalın 'Personel için Kullanılması Önerilen Süre'si = istisnalı maks − içeride TOPLAM.
+    # Gün bazlı değil (izin ve 9 saati aşan PDKS günleri farkı açıklar) → yalnız loga yazılır, akışı etkilemez.
+    onerilen = page.evaluate(
+        r"""() => {const lb=[...document.querySelectorAll('label,span,div,td')].filter(e=>e.offsetParent!==null
+               && e.children.length===0 && /Önerilen Süre/.test(e.textContent||'')).pop();
+             if(!lb) return '';
+             let box=lb.parentElement;
+             for(let i=0;i<3 && box;i++){const inp=[...box.querySelectorAll('input')].find(x=>/^\d{1,3}:\d{2}$/.test((x.value||'').trim()));
+               if(inp) return inp.value.trim(); box=box.parentElement;}
+             return '';}""")
+    log(f"  KONTROL: tikli={len(ticked)} | İstenilen={istenilen} (beklenen {to_hhmm(expected)}) ✓"
+        + (f" | portal önerisi={onerilen} (bilgi)" if onerilen else ""))
 
     msg = save_draft(page)
     onaylandi = False
@@ -1630,6 +1930,7 @@ def main():
         browser, page = attach_browser(pw)
         if CONFIG.get("auto_onay"):
             page.on("dialog", lambda d: d.accept())   # 'Onaya Gönder' native confirm() çıkarsa kabul (submit iptal etme)
+        _hata_kaydedici_kur(page)   # hata anı dökümü için son konsol/ağ olayları (+DGS_TRACE=1 trace) — 2026-11-24
         try:
             assert_logged_in(page)
             # Haftalık program haritasını BİR KEZ oku (5 gün/45 saat mi, 6 gün mü) — kişi-bazında hedef için.
@@ -1654,6 +1955,7 @@ def main():
                     done_skipped += 1
                     continue
                 log(f"\n=== [{i}/{len(targets)}] {person.ad_soyad} (proje: {person.proje_adi[:35]}) ===")
+                _iz_kisi_basla()   # DGS_TRACE=1 değilse hiçbir şey yapmaz
                 try:
                     assert_logged_in(page)  # her kişiden önce oturum teyidi
                     r = process_one_person(page, person, first, sched_map)
@@ -1667,6 +1969,7 @@ def main():
                     ts = int(time.time()); shot = f"dgs_verify_{ts}.png"
                     try: page.screenshot(path=shot, full_page=True)
                     except Exception: pass
+                    _hata_dokumu(page, shot)   # DOM + durum (+trace) — temizlikten ÖNCE (2026-11-24)
                     _ekrani_temizle(page)   # popup/overlay ekranda kalmasın → sonraki kişi bloklanmasın (2026-07-16 BV)
                     r = {"ad": person.ad_soyad, "ok": False, "mesaj": f"DOĞRULAMA HATASI (KAYDEDİLMEDİ): {e} (ss:{shot})"}
                     # kart yarım kaldı; sonraki kişi reopen_fresh_form ile temiz başlar
@@ -1675,9 +1978,11 @@ def main():
                     ts = int(time.time()); shot = f"dgs_hata_{ts}.png"
                     try: page.screenshot(path=shot, full_page=True)
                     except Exception: pass
+                    _hata_dokumu(page, shot)   # DOM + durum (+trace) — temizlikten ÖNCE (2026-11-24)
                     _ekrani_temizle(page)
                     r = {"ad": person.ad_soyad, "ok": False, "mesaj": f"HATA (KAYDEDİLMEDİ): {e} (ss:{shot})"}
                     first = False
+                _iz_kisi_bitir()   # başarılı kişinin trace parçasını at (hatalınınki yukarıda yazıldı)
                 results.append(r)
                 log(f"  -> {r['mesaj']}")
                 if r["ok"] and args.commit and "ATLANDI" not in r["mesaj"] and "DRY-RUN" not in r["mesaj"]:

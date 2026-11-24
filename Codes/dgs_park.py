@@ -121,6 +121,7 @@ def run(park: Park, overrides=None):
     # --- dönem/sheet: verilmediyse otomatik türet (dgs_onaya/kontrol'e de aynı değeri geçir) ---
     donem = _arg_value(argv, "--donem")
     label, _regex, ay_no = D.donem_label_and_regex(donem)
+    D.CONFIG["donem_text"] = label   # 'liste' main()'e uğramaz; firma tablosu okuyucusu dönemi buradan alır
     if "--sheet" not in argv:
         argv += ["--sheet", D.TR_AYLAR_TITLE[ay_no]]
     if "--donem" not in argv:
@@ -395,7 +396,9 @@ def _kapanis(D, park: Park, argv: list[str], sheet: str, donem: str, istisna_yol
         return any(k in r for k in (
             "istenilen toplam", "pdks", "#n/a", "oneri cikmad", "proje", "kimlik", "eslesme bulunam",
             # ⚠ MÜKERRER-RİSKLİ / çözülemez (uzaktan-çalışma, tüm günler pdks): retry ETME, hemen MANUEL.
-            "mukerrer", "gitmis olabilir", "basari ile kayit", "en az 1 gun"))
+            "mukerrer", "gitmis olabilir", "basari ile kayit", "en az 1 gun",
+            # firma geneli 10766 uzaktan çalışma kotası doldu → retry boşuna, firma kararı
+            "uzaktan calisma kotasi", "kalan sure"))
 
     MAX_TUR = 3
     vazgec, ad_map, son_eksik = dict(skip_giris), {}, []   # vazgec: fold→{ad,sebep} (kalıcı; ana-giriş skip'i dahil)

@@ -110,7 +110,7 @@ def process_one(page, name: str, dry: bool) -> str:
     target = rows[0]
     log(f"  bulundu: {target['pers_raw'][:30]} | statü={target['onay']} | toplam={target['total']}")
     # 2) kayda çift-tıkla → form aç (loading beklemeli)
-    if not O.dblclick_row(page, target["ad_fold"]):
+    if not O.dblclick_row(page, target["ad_fold"], O.fold(target["project"])):
         return "hata: kayıt satırı çift-tıklanamadı"
     D.wait_for_form_idle(page)
     if not O.wait_form_open(page):
@@ -156,8 +156,18 @@ def main():
     ap.add_argument("--file", default=None, help="Her satırda bir ad-soyad")
     ap.add_argument("--commit", action="store_true", help="GERÇEK sil (yoksa DRY-RUN)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--park", default=None, help="Park kodu (dgs_park.PARKS: TPI, BV, TPIz, Yıldız, Ulutek, Dijitalpark)")
     args = ap.parse_args()
     dry = not args.commit
+    if args.park:
+        import dgs_park
+        if args.park not in dgs_park.PARKS:
+            log(f"HATA: bilinmeyen park {args.park!r}"); sys.exit(1)
+        D.CONFIG["portal_url"] = dgs_park.PARKS[args.park].portal_url   # attach_browser bu host'u seçer
+        D.CONFIG["cdp_url"] = os.environ.get("DGS_CDP", dgs_park.PARKS[args.park].cdp)
+        if args.park == "Dijitalpark":                                   # aynı parkta birden çok firma
+            D.CONFIG["require_company_guard"] = True
+            D.CONFIG["expected_company"] = os.environ.get("DGS_EXPECTED_COMPANY", "").strip()
 
     names = []
     if args.person: names = [args.person.strip()]

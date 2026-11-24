@@ -30,6 +30,7 @@ app_icon = 'assets/etkn-app-icon.ico' if sys.platform.startswith('win') else 'as
 hiddenimports += [
     'izin_gui', 'izin_otomasyon', 'izin_onaya_dosyali_yildiz', 'izin_login_check',
     'izin_poc', 'izin_onaya', 'izin_belge', 'izin_data_v2', 'izin_frozen',
+    'firma_izin_tablosu', 'portal_tenant',                            # firma tablosu (izin aralıkları) + firma kilidi
     'openpyxl', 'PIL', 'customtkinter', 'darkdetect', 'tkinter', 'tkinter.filedialog',
     'tkinter.messagebox',
 ]

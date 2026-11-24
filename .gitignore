@@ -28,6 +28,11 @@ GIRIS_BILGILERI.md
 *.log
 *.jsonl
 *.png
+# hata anı dökümü (2026-11-24): DOM/durum/trace — ad ve T.C. içerir
+*.html
+*.zip
+dgs_hata_*
+dgs_verify_*
 izin_done_*
 izin_onaya_done_*
 dgs_done_*

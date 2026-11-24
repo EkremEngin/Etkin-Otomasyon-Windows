@@ -78,7 +78,8 @@ PARKS: "OrderedDict[str, Park]" = OrderedDict([
     ("İYTE",   Park("İYTE",   "Teknopark İzmir",             "https://argeportal.teknoparkizmir.com.tr/",    "TPIz",   True,  "ortak",      "yıllık izin formu")),
     ("YTP",    Park("YTP",    "Davutpaşa Yıldız Teknopark",  "https://argeportal.yildizteknopark.com.tr/",   "Yıldız", True,  "per_person", "Ücretli Yıllık İzin Formu")),
     ("ULUTEK", Park("ULUTEK", "Bursa Ulutek Teknopark",      "https://argeportal.ulutek.com.tr/",            "Ulutek", True,  "per_person", "Yıllık İzin Dilekçesi")),
-    ("DIJITALPARK", Park("DIJITALPARK", "Dijitalpark Teknokent", "https://argeportal.dijitalparkteknokent.com.tr/", "Dijitalpark", True, "", onay_dogrulandi=False)),
+    # 2026-11-24 canlı: Dijitalpark izin onayı BELGESİZ çalışıyor (10/10 "Yönetici Şirket Tarafından Onaylanmış").
+    ("DIJITALPARK", Park("DIJITALPARK", "Dijitalpark Teknokent", "https://argeportal.dijitalparkteknokent.com.tr/", "Dijitalpark", True, "")),
     ("ARI",    Park("ARI",    "ARI Teknokent",               "https://portal.ariteknokent.com.tr/",          "Arı",    False, "")),
     ("ODTÜ",   Park("ODTÜ",   "ODTÜ Teknokent",              "https://portal.odtuteknokent.com.tr/",         "ODTÜ",   False, "")),
 ])
@@ -233,6 +234,43 @@ def _norm_date(v):
     return s, None
 
 
+def _read_firma_tablosu(path: str, strict: bool, default_park: str | None):
+    """Firma çalışan tablosu → günlük satırlar (geçici v2 dosyası) → aynı doğrulayıcıdan geçir.
+    Sağlık/doğum günü gibi hak edilmemiş izin günleri GİRİLMEZ (gün boş kalır, teşvik dışı) ve raporlanır."""
+    import tempfile
+    import firma_izin_tablosu as F
+    park = resolve_park(default_park)
+    if park is None:
+        raise DataError("Firma çalışan tablosunda park sütunu yok. Tek park seçin.")
+    yil, ay = F.donem_tahmin(path)
+    try:
+        kisiler = F.oku(path, yil, ay)
+    except F.TabloHatasi as e:
+        raise DataError(str(e)) from None
+    bos = [(k, g) for k in kisiler for g in k.izinler if not F.izin_girilir(k, g)]
+    if bos:
+        print(f"[FİRMA TABLOSU] {len(bos)} gün hak edilmiş izin DEĞİL → izin girilmeyecek, gün boş kalacak "
+              "(DGS de girilmez, teşvik dışı):", flush=True)
+        for k, g in bos:
+            print(f"    {k.ad}: {g.tarih:%d.%m.%Y} {F.izin_girilmeme_sebebi(k, g)}", flush=True)
+    girilecek = [F.Calisan(k.satir, k.tc, k.ad, k.tip, k.giris, k.cikis,
+                           [g for g in k.izinler if F.izin_girilir(k, g)], k.beyan_toplam) for k in kisiler]
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)                                   # Windows: açık tanıtıcıyla yeniden açılamaz
+    try:
+        n = F.v2_yaz([k for k in girilecek if k.izinler], park.code, tmp)
+        if n == 0:
+            raise DataError(f"{_TURKCE_AY[ay]} {yil}: firma tablosunda girilecek yıllık izin yok.")
+        by_park, meta = read_izin_v2(tmp, sheet="Izinler", strict=strict)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    meta["sheet"] = f"firma tablosu ({os.path.basename(path)})"
+    return by_park, meta
+
+
 def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True,
                  default_park: str | None = None):
     """
@@ -244,8 +282,13 @@ def read_izin_v2(path: str, sheet: str | None = None, strict: bool = True,
 
     strict=True: SERT hata (geçersiz T.C. / bilinmeyen park / gün≠1,0.5 / tarih dönem-dışı) varsa
                  TÜMÜ toplanır ve DataError fırlatılır (portala dokunulmaz).
+    Firma çalışan tablosu (kişi başına izin ARALIKLARI, ör. bir Dijitalpark firması) da kabul edilir:
+    günlere açılır, yalnız hak edilmiş (yıllık) izin girilir — bkz. _read_firma_tablosu.
     """
     path = os.path.expanduser(path)
+    import firma_izin_tablosu                      # döngüsel import: o modül bunu import ediyor
+    if sheet is None and firma_izin_tablosu.firma_tablosu_mu(path):
+        return _read_firma_tablosu(path, strict, default_park)
     wb = load_workbook(path, data_only=True, read_only=True)
     try:
         sh = sheet or _pick_sheet(wb)

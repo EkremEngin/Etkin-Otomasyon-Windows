@@ -119,7 +119,9 @@ class DijitalparkWorkbookTests(unittest.TestCase):
         recon = izin_otomasyon.reconcile(by_park["DIJITALPARK"], results,
                                          izin_data_v2.PARKS["DIJITALPARK"])
         self.assertEqual(recon["kayip"], [])
-        self.assertFalse(izin_data_v2.PARKS["DIJITALPARK"].onay_dogrulandi)
+        # 2026-11-24 canlı: Dijitalpark izin onayı belgesiz doğrulandı.
+        self.assertTrue(izin_data_v2.PARKS["DIJITALPARK"].onay_dogrulandi)
+        self.assertEqual(izin_data_v2.PARKS["DIJITALPARK"].onay_pdf, "")
 
         incomplete = izin_otomasyon.reconcile(by_park["DIJITALPARK"], results[:1],
                                                izin_data_v2.PARKS["DIJITALPARK"])

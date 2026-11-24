@@ -315,7 +315,15 @@ def run_approval_pdfsiz(page, park: Park, meta: dict, limit: int, people=None):
     """PDF'siz parklar (TPI/BV/ULUTEK): kanıtlı izin_onaya akışı — AYNI page üzerinde (inline).
     KİMLİK: onay da maskeli-T.C. ile eşleşir (isim evlilik/kızlık farkında taslağı bulamıyordu — 2026-07-09)."""
     ay_key = meta["ay_key"]
-    done_file = f"izin_done_{park.label}_{ay_key}.txt"
+    ek = ""
+    if park.code == "DIJITALPARK":     # girişle AYNI firma eki: aynı parktaki firmaların dosyaları ayrışır
+        import portal_tenant
+        expected = os.environ.get("DGS_EXPECTED_COMPANY", "").strip()
+        if not expected:
+            log(f"[ONAY] {park.code}: beklenen firma unvanı yok — onaya gönderilmedi.")
+            return
+        ek = "_" + portal_tenant.resume_suffix(expected)
+    done_file = f"izin_done_{park.label}_{ay_key}{ek}.txt"
     if not os.path.exists(done_file):
         log(f"[ONAY] {park.code}: {done_file} yok — önce giriş (--commit) gerekli. Atlanıyor.")
         return
@@ -326,7 +334,7 @@ def run_approval_pdfsiz(page, park: Park, meta: dict, limit: int, people=None):
         tc = str(getattr(p, "tc", "") or "").strip()
         if tc.isdigit() and len(tc) == 11:
             our_tc.add(tc[:2] + tc[-2:])
-    onay_file = f"izin_onaya_done_{park.label}_{ay_key}.txt"
+    onay_file = f"izin_onaya_done_{park.label}_{ay_key}{ek}.txt"
     onaylanan = set()
     if os.path.exists(onay_file):
         onaylanan = set(fold(l) for l in open(onay_file, encoding="utf-8").read().splitlines() if l.strip())
@@ -340,7 +348,7 @@ def run_approval_pdfsiz(page, park: Park, meta: dict, limit: int, people=None):
 
 def run_approval_pdfli(park: Park, meta: dict, people, belge_klasor: str | None, cdp: str, limit: int,
                        ortak_belge: str | None = None, kisi_klasoru: str | None = None,
-                       kaydedilenler=None, only_person: str | None = None):
+                       kaydedilenler=None, only_person: str | None = None, kisi_dosyalari=None):
     """Belge denetiminde bulunan kişisel dosyaları ya da parkın ortak PDF'ini yükleyiciye ilet."""
     ay_key = meta["ay_key"]
     done_file = f"izin_done_{park.label}_{ay_key}.txt"
@@ -348,7 +356,7 @@ def run_approval_pdfli(park: Park, meta: dict, people, belge_klasor: str | None,
         log(f"[ONAY] {park.code}: {done_file} yok — önce giriş (--commit) gerekli. Atlanıyor.")
         return
     r = izin_belge.report(park, people, base=belge_klasor, kisi_klasoru=kisi_klasoru,
-                          ortak_belge=ortak_belge)
+                          ortak_belge=ortak_belge, kisi_dosyalari=kisi_dosyalari)
     if not r["hazir"]:
         log(f"[ONAY] {park.code}: {r['eslesen']}/{r['toplam']} çalışanın belgesi eşleşti. "
             f"{r['hata']} Belgeler tamamlanana kadar kayıtlar taslak kalacak.")
@@ -387,7 +395,8 @@ def run_approval_pdfli(park: Park, meta: dict, people, belge_klasor: str | None,
 # Plan modu (portalsız ön-uçuş — offline test edilebilir)
 # ---------------------------------------------------------------------------
 def run_plan(excel: str, parklar, belge_klasor: str | None, detay: bool = True,
-             ortak_belge: str | None = None, default_park: str | None = None, kisi_klasoru: str | None = None):
+             ortak_belge: str | None = None, default_park: str | None = None, kisi_klasoru: str | None = None,
+             kisi_dosyalari=None):
     by_park, meta = data.read_izin_v2(excel, strict=True,
                                      default_park=default_park or (parklar[0].code if parklar and len(parklar) == 1 else None))
     print("=" * 74)
@@ -404,9 +413,9 @@ def run_plan(excel: str, parklar, belge_klasor: str | None, detay: bool = True,
         pk = PARKS[code]
         people = by_park[code]
         rd = None
-        if pk.onay_pdf or (not pk.onay_dogrulandi and (kisi_klasoru or belge_klasor)):
+        if pk.onay_pdf or (not pk.onay_dogrulandi and (kisi_klasoru or belge_klasor or kisi_dosyalari)):
             rd = izin_belge.source_readiness(pk, people, base=belge_klasor, ortak_belge=ortak_belge,
-                                             kisi_klasoru=kisi_klasoru)
+                                             kisi_klasoru=kisi_klasoru, kisi_dosyalari=kisi_dosyalari)
             if rd["mod"] == izin_belge.ORTAK:
                 durum = (f"ORTAK belge '{os.path.basename(rd['ortak'])}' HAZIR ✓" if rd["hazir"]
                          else f"ORTAK belge ⚠ {rd['hata'] or 'Eksik'}")
@@ -454,6 +463,7 @@ def main():
                     help="PDF'li park için belge klasörü. Yoksa Masaüstü konvansiyonu (~/Desktop/İzin Belgeleri/<Park> İzin Belgeleri) aranır.")
     kaynak = ap.add_mutually_exclusive_group()
     kaynak.add_argument("--kisi-belge-klasoru", help="Kişisel izin PDF'lerinin aranacağı klasör ve alt klasörleri.")
+    kaynak.add_argument("--kisi-belge-listesi", help="Tek tek seçilmiş kişisel PDF'lerin listesi (UTF-8, satır başına bir yol).")
     kaynak.add_argument("--ortak-belge", default=None,
                     help="ORTAK modlu parkta (İYTE) toplu belgenin yolu — klasör keşfini baypas eder. "
                          "Aynı PDF o parktaki HERKESİN kaydına yüklenir.")
@@ -471,6 +481,10 @@ def main():
     if not os.path.exists(excel):
         log(f"HATA: Excel bulunamadı: {excel}"); sys.exit(1)
     try:
+        kisi_dosyalari = izin_belge.dosya_listesi_oku(args.kisi_belge_listesi)
+    except OSError as e:
+        log(f"HATA: seçilen PDF listesi okunamadı: {e}"); sys.exit(1)
+    try:
         parklar = parse_parklar(args.parklar)
     except data.DataError as e:
         log(f"❌ {e}"); sys.exit(2)
@@ -487,7 +501,7 @@ def main():
 
     if args.plan:
         run_plan(excel, parklar, args.belge_klasor, ortak_belge=args.ortak_belge,
-                 default_park=args.park, kisi_klasoru=args.kisi_belge_klasoru)
+                 default_park=args.park, kisi_klasoru=args.kisi_belge_klasoru, kisi_dosyalari=kisi_dosyalari)
         return
 
     # --- Canlı: Playwright motorunu şimdi import et (plan modunda gereksiz) ---
@@ -555,7 +569,8 @@ def main():
                          if r["durum"] in ("girildi", "zaten_girili")}
         run_approval_pdfli(active, meta, targets, args.belge_klasor, cdp, args.limit,
                            ortak_belge=args.ortak_belge, kisi_klasoru=args.kisi_belge_klasoru,
-                           kaydedilenler=kaydedilenler, only_person=args.person)
+                           kaydedilenler=kaydedilenler, only_person=args.person,
+                           kisi_dosyalari=kisi_dosyalari)
 
     log("\nHATIRLATMA: Giriş TASLAK. PDF'siz parklar --onayla ile onaya gitti; PDF'li parklar belge hazırsa gitti, "
         "değilse taslak kaldı (adaptif).")
